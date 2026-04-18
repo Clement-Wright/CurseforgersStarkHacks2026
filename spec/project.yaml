@@ -25,6 +25,14 @@ time:
   base_unit: ns
 world_frame_policy: fiducial_center
 metric_scale_policy: fiducial_marker
+gamma:
+  primary_backbone: fourdhumans
+  export_world_estimates_when_available: true
+  active_segment_policy: non_preroll
+  overlay_sample_count: 20
+  smoothing:
+    method: moving_average
+    window_size: 5
 ontology:
   target_object_id: target_object
   receptacle_object_id: receptacle
@@ -37,5 +45,7 @@ acceptance:
   beta_min_registered_fraction: 0.7
   beta_min_registered_keyframes: 20
   beta_max_mean_reprojection_error_px: 1.5
+  gamma_min_primary_track_fraction: 0.95
+  gamma_min_median_wrist_confidence: 0.5
   gamma_max_id_switches: 1
   delta_min_mask_iou_sample: 0.8

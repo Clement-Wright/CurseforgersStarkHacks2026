@@ -16,6 +16,7 @@ dependencies = [
   "opencv-contrib-python>=4.10,<5",
   "Pillow>=10,<12",
   "pydantic>=2.7,<3",
+  "pyarrow>=16,<21",
   "PyYAML>=6.0,<7",
   "typer>=0.12,<1",
 ]

@@ -28,6 +28,7 @@ def test_checked_in_bundle_validates() -> None:
     bundle = validate_bundle(load_bundle(Path("spec")))
 
     assert bundle.project.capture.preroll_seconds == pytest.approx(10.0)
+    assert bundle.project.gamma.primary_backbone == "fourdhumans"
     assert bundle.task.pick_object.ontology_id == "target_object"
     assert bundle.capture.beta.normalization.world_frame == "fiducial_center"
     assert bundle.env_specs["sfm"].name == "video-task-compiler-sfm"
@@ -97,6 +98,32 @@ def test_env_files_must_pin_python_310(tmp_path: Path) -> None:
 
     assert any(issue.file_path.endswith("sfm.environment.yml") for issue in excinfo.value.issues)
     assert any("python=3.10" in issue.reason for issue in excinfo.value.issues)
+
+
+def test_missing_gamma_block_reports_targeted_error(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    project_path = bundle_root / "spec" / "project.yaml"
+    project_data = _load_yaml(project_path)
+    del project_data["gamma"]
+    _write_yaml(project_path, project_data)
+
+    with pytest.raises(SpecValidationError) as excinfo:
+        load_bundle(bundle_root / "spec")
+
+    assert any(issue.field_path == "gamma" for issue in excinfo.value.issues)
+
+
+def test_invalid_gamma_acceptance_threshold_is_rejected(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    project_path = bundle_root / "spec" / "project.yaml"
+    project_data = _load_yaml(project_path)
+    project_data["acceptance"]["gamma_min_median_wrist_confidence"] = 1.2
+    _write_yaml(project_path, project_data)
+
+    with pytest.raises(SpecValidationError) as excinfo:
+        load_bundle(bundle_root / "spec")
+
+    assert any(issue.field_path == "acceptance.gamma_min_median_wrist_confidence" for issue in excinfo.value.issues)
 
 
 def test_task_regions_must_stay_inside_workspace(tmp_path: Path) -> None:

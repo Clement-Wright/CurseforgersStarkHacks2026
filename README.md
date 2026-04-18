@@ -13,16 +13,19 @@ Alpha now freezes the deterministic project contract. Beta decodes raw monocular
 video with PyAV, uses the static pre-roll as the source of truth for COLMAP
 reconstruction, localizes later frames against that frozen model, normalizes the
 result into a fiducial-aligned metric world frame, and preserves canonical
-COLMAP artifacts by default.
+COLMAP artifacts by default. Gamma runs 4DHumans over beta’s extracted frames,
+selects one primary demonstrator track, preserves the native tracklets, and
+exports a flat arm-observables layer for downstream robotics code.
 
 ## What is included
 
 - A Python package in `src/video_task_compiler/`
 - A `vtc` CLI with `spec init`, `spec validate`, and `spec schema`
 - A `vtc video ingest-monocular` beta pipeline command
+- A `vtc human extract-monocular` gamma pipeline command
 - Typed spec models with cross-file compatibility validation
 - A checked-in example bundle in `spec/`, `env/`, and `checklists/`
-- Tests covering the supported contract, validation rules, and beta pipeline logic
+- Tests covering the supported contract, validation rules, beta, and gamma logic
 
 ## Quick start
 
@@ -32,6 +35,7 @@ vtc spec validate --spec-dir spec
 vtc spec schema --out-dir build/schemas
 vtc spec init --template ur5e_monocular_pick_place --output-dir ./example-bundle
 vtc video ingest-monocular --spec-dir spec --video ./demo.mp4 --out-dir ./artifacts/run01
+vtc human extract-monocular --spec-dir spec --beta-dir ./artifacts/run01 --out-dir ./artifacts/run01 --fourdhumans-root /path/to/4DHumans --smpl-model /path/to/SMPL_NEUTRAL.pkl
 ```
 
 ## Alpha contract
@@ -54,6 +58,7 @@ These files must be versioned together and validated as one bundle. The checked
 in profile requires:
 
 - `project.yaml` to own pre-roll, time, acceptance gates, and artifact owners
+- `project.yaml` to own gamma backbone selection, smoothing, and QC thresholds
 - `task.yaml` to reference ontology IDs instead of relying on free-form naming
 - `coordinate_frames.md` to carry machine-checkable YAML front matter
 - the env files to pin `python=3.10`
@@ -84,9 +89,22 @@ rest of the clip is attached by direct localization where possible and is
 otherwise left in the exported timeline as `registered=false` /
 `pose_status=unlocalized`.
 
+## Gamma outputs
+
+The monocular gamma pipeline writes:
+
+- `human/native/4dhumans_tracks.pkl`
+- `human/smpl_tracks.pkl`
+- `human/arm_observables.parquet`
+- `human/reprojection_overlays/`
+- `human/summary.json`
+
+Gamma is 4DHumans-only in the current profile. It always preserves 2D evidence
+plus camera-relative 3D, and it adds world-aligned estimates when beta camera
+poses support them for that frame.
+
 ## Out of scope
 
-- Human pose tracking
 - Object detection or segmentation
 - MuJoCo MJCF compilation
 - Imitation learning or RL training

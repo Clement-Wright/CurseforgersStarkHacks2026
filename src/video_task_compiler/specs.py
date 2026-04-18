@@ -289,8 +289,27 @@ class ProjectAcceptanceSpec(BaseModel):
     beta_min_registered_fraction: float = Field(gt=0.0, le=1.0)
     beta_min_registered_keyframes: int = Field(ge=1)
     beta_max_mean_reprojection_error_px: float = Field(gt=0.0)
+    gamma_min_primary_track_fraction: float = Field(gt=0.0, le=1.0)
+    gamma_min_median_wrist_confidence: float = Field(ge=0.0, le=1.0)
     gamma_max_id_switches: int = Field(ge=0)
     delta_min_mask_iou_sample: float = Field(gt=0.0, le=1.0)
+
+
+class ProjectGammaSmoothingSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["moving_average"]
+    window_size: int = Field(ge=1)
+
+
+class ProjectGammaSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    primary_backbone: Literal["fourdhumans"]
+    export_world_estimates_when_available: bool
+    active_segment_policy: Literal["non_preroll"]
+    overlay_sample_count: int = Field(ge=1)
+    smoothing: ProjectGammaSmoothingSpec
 
 
 class ProjectSpec(BaseModel):
@@ -309,6 +328,7 @@ class ProjectSpec(BaseModel):
     time: ProjectTimeSpec
     world_frame_policy: Literal["fiducial_center"]
     metric_scale_policy: Literal["fiducial_marker"]
+    gamma: ProjectGammaSpec
     ontology: ProjectOntologyRefsSpec
     sponsor_resources: list[str] = Field(min_length=1)
     acceptance: ProjectAcceptanceSpec
@@ -822,6 +842,33 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
                 bundle.project_path,
                 "world_frame_policy",
                 "project world frame policy must match capture.beta.normalization.world_frame",
+            )
+        )
+
+    if bundle.project.gamma.primary_backbone != "fourdhumans":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "gamma.primary_backbone",
+                "gamma currently supports only the fourdhumans primary backbone",
+            )
+        )
+
+    if not bundle.project.gamma.export_world_estimates_when_available:
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "gamma.export_world_estimates_when_available",
+                "gamma must export world estimates whenever beta camera poses support them",
+            )
+        )
+
+    if bundle.project.gamma.active_segment_policy != "non_preroll":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "gamma.active_segment_policy",
+                "gamma currently defines the active segment as all non-preroll frames",
             )
         )
 

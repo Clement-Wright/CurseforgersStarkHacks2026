@@ -1,10 +1,15 @@
 name: video-task-compiler-human
 channels:
   - conda-forge
+# 4DHumans itself remains an external checkout. Provide it separately together
+# with the neutral SMPL model asset and point gamma at both paths at runtime.
 dependencies:
   - python=3.10
   - pip
   - numpy
+  - pillow
+  - pyarrow
+  - pyyaml
   - pip:
       - torch
       - torchvision
