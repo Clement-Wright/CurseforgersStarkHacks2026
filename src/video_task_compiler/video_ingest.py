@@ -7,14 +7,15 @@ import math
 import os
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import numpy as np
+import yaml
 from PIL import Image, ImageDraw
 
-from .specs import CaptureSpec, SpecBundle
+from .specs import PROJECT_SCHEMA_VERSION, CaptureSpec, SpecBundle
 
 
 class VideoIngestError(Exception):
@@ -28,7 +29,9 @@ class DependencyError(VideoIngestError):
 @dataclass
 class DecodedFrame:
     index: int
-    timestamp_sec: float
+    pts: int
+    pts_sec: float
+    t_ns: int
     rgb: np.ndarray
 
 
@@ -36,11 +39,15 @@ class DecodedFrame:
 class FrameRecord:
     frame_index: int
     frame_name: str
-    timestamp_sec: float
-    path: Path
+    pts: int
+    pts_sec: float
+    t_ns: int
+    image_path: Path
+    segment: str = "unassigned"
     is_keyframe: bool = False
     registered: bool = False
-    pose_source: str = "missing"
+    pose_status: str = "unlocalized"
+    colmap_image_id: int | None = None
 
 
 @dataclass
@@ -63,6 +70,7 @@ class ColmapCamera:
 class ColmapPoint3D:
     point_id: int
     xyz: np.ndarray
+    rgb: tuple[int, int, int]
     error: float
 
 
@@ -98,10 +106,22 @@ class ParsedColmapModel:
 
 
 @dataclass
+class ColmapPipelineResult:
+    base_model: ParsedColmapModel
+    final_model: ParsedColmapModel
+    database_path: Path
+    sparse_root: Path
+    sparse_text_root: Path
+    component_count: int
+    staging_dir: Path
+
+
+@dataclass
 class PoseEstimate:
     rotation_wc: np.ndarray
     translation_wc: np.ndarray
     source: str
+    colmap_image_id: int | None = None
 
 
 @dataclass
@@ -109,6 +129,8 @@ class SimilarityTransform:
     scale: float
     rotation: np.ndarray
     translation: np.ndarray
+    orientation_spread_deg: float
+    inlier_count: int
 
 
 @dataclass
@@ -146,8 +168,8 @@ def resolve_colmap_binary(explicit: str | None = None) -> str:
 
 
 def missing_python_dependencies() -> list[str]:
-    missing = []
-    for module_name in ("numpy", "PIL", "imageio", "imageio_ffmpeg", "cv2"):
+    missing: list[str] = []
+    for module_name in ("av", "numpy", "PIL", "cv2", "yaml"):
         if importlib.util.find_spec(module_name) is None:
             missing.append(module_name)
 
@@ -170,6 +192,14 @@ def ensure_beta_dependencies(colmap_bin: str | None = None) -> str:
     return binary
 
 
+def timestamp_seconds_from_pts(pts: int, time_base: Any) -> float:
+    return float(pts * time_base)
+
+
+def relative_timestamp_ns(absolute_sec: float, origin_sec: float) -> int:
+    return int(round((absolute_sec - origin_sec) * 1_000_000_000))
+
+
 def extract_frames_from_source(
     decoded_frames: Iterable[DecodedFrame],
     frames_dir: Path,
@@ -185,8 +215,10 @@ def extract_frames_from_source(
             FrameRecord(
                 frame_index=decoded.index,
                 frame_name=frame_name,
-                timestamp_sec=float(decoded.timestamp_sec),
-                path=target,
+                pts=decoded.pts,
+                pts_sec=float(decoded.pts_sec),
+                t_ns=int(decoded.t_ns),
+                image_path=target,
             )
         )
     if not records:
@@ -199,37 +231,56 @@ def decode_video_to_frames(
     frames_dir: Path,
     image_format: str,
 ) -> tuple[list[FrameRecord], dict[str, Any]]:
-    import cv2  # type: ignore
+    import av  # type: ignore
 
-    capture = cv2.VideoCapture(str(video_path))
-    if not capture.isOpened():
-        raise VideoIngestError(f"unable to open video: {video_path}")
-
-    width_px = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height_px = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    nominal_fps = float(capture.get(cv2.CAP_PROP_FPS))
     decoded_frames: list[DecodedFrame] = []
-    last_timestamp = -math.inf
-    frame_index = 0
+    width_px = 0
+    height_px = 0
+    nominal_fps = 0.0
+    first_absolute_sec: float | None = None
+    last_relative_sec = -math.inf
 
     try:
-        while True:
-            ok, frame_bgr = capture.read()
-            if not ok:
-                break
-            timestamp_sec = float(capture.get(cv2.CAP_PROP_POS_MSEC)) / 1000.0
-            if not math.isfinite(timestamp_sec):
-                raise VideoIngestError("decoder did not expose a usable frame timestamp")
-            if timestamp_sec < last_timestamp:
-                raise VideoIngestError("decoded frame timestamps were not monotonic")
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            decoded_frames.append(
-                DecodedFrame(index=frame_index, timestamp_sec=timestamp_sec, rgb=frame_rgb)
-            )
-            last_timestamp = timestamp_sec
-            frame_index += 1
-    finally:
-        capture.release()
+        with av.open(str(video_path)) as container:
+            video_stream = next((stream for stream in container.streams if stream.type == "video"), None)
+            if video_stream is None:
+                raise VideoIngestError(f"no video stream found in {video_path}")
+            if video_stream.average_rate is not None:
+                nominal_fps = float(video_stream.average_rate)
+
+            frame_index = 0
+            for frame in container.decode(video_stream):
+                if frame.pts is None:
+                    raise VideoIngestError("decoded frame did not expose a container PTS")
+                time_base = frame.time_base or video_stream.time_base
+                if time_base is None:
+                    raise VideoIngestError("decoded frame did not expose a usable time_base")
+
+                absolute_sec = timestamp_seconds_from_pts(int(frame.pts), time_base)
+                if first_absolute_sec is None:
+                    first_absolute_sec = absolute_sec
+                relative_sec = absolute_sec - first_absolute_sec
+                if relative_sec + 1e-12 < last_relative_sec:
+                    raise VideoIngestError("decoded frame timestamps were not monotonic")
+
+                rgb = frame.to_ndarray(format="rgb24")
+                width_px = int(frame.width)
+                height_px = int(frame.height)
+                decoded_frames.append(
+                    DecodedFrame(
+                        index=frame_index,
+                        pts=int(frame.pts),
+                        pts_sec=relative_sec,
+                        t_ns=relative_timestamp_ns(absolute_sec, first_absolute_sec),
+                        rgb=rgb,
+                    )
+                )
+                last_relative_sec = relative_sec
+                frame_index += 1
+    except VideoIngestError:
+        raise
+    except Exception as exc:  # pragma: no cover - exercised in live runs
+        raise VideoIngestError(f"unable to decode video with PyAV: {exc}") from exc
 
     records = extract_frames_from_source(decoded_frames, frames_dir=frames_dir, image_format=image_format)
     metadata = {
@@ -237,36 +288,69 @@ def decode_video_to_frames(
         "height_px": height_px,
         "nominal_fps": nominal_fps,
         "frame_count": len(records),
-        "timestamp_source": "opencv_pos_msec",
+        "timestamp_source": "pyav_pts_time_base",
+        "duration_sec": records[-1].pts_sec if records else 0.0,
     }
     return records, metadata
 
 
-def select_keyframe_indices(records: Sequence[FrameRecord], sample_fps: float) -> list[int]:
+def assign_frame_segments(
+    records: Sequence[FrameRecord],
+    preroll_seconds: float,
+    postroll_seconds: float = 0.0,
+) -> None:
     if not records:
-        raise VideoIngestError("cannot select keyframes from an empty frame set")
-    if len(records) == 1:
-        return [0]
+        raise VideoIngestError("cannot segment an empty frame sequence")
+
+    clip_end_sec = records[-1].pts_sec
+    for record in records:
+        if record.pts_sec <= preroll_seconds + 1e-9:
+            record.segment = "preroll"
+        elif postroll_seconds > 0.0 and (clip_end_sec - record.pts_sec) <= postroll_seconds + 1e-9:
+            record.segment = "postroll"
+        else:
+            record.segment = "demo"
+
+
+def select_keyframe_indices(
+    records: Sequence[FrameRecord],
+    sample_fps: float,
+    segment: str = "preroll",
+) -> list[int]:
+    segment_indices = [index for index, record in enumerate(records) if record.segment == segment]
+    if not segment_indices:
+        raise VideoIngestError(f"cannot select keyframes because no frames were tagged as '{segment}'")
+    if len(segment_indices) == 1:
+        return segment_indices
 
     interval_sec = 1.0 / sample_fps
-    selected = {0, len(records) - 1}
-    next_target = records[0].timestamp_sec + interval_sec
+    selected = {segment_indices[0], segment_indices[-1]}
+    next_target = records[segment_indices[0]].pts_sec + interval_sec
 
-    for index, record in enumerate(records[1:-1], start=1):
-        if record.timestamp_sec + 1e-9 >= next_target:
+    for index in segment_indices[1:-1]:
+        record = records[index]
+        if record.pts_sec + 1e-9 >= next_target:
             selected.add(index)
-            while next_target <= record.timestamp_sec + 1e-9:
+            while next_target <= record.pts_sec + 1e-9:
                 next_target += interval_sec
 
     return sorted(selected)
 
 
-def copy_keyframes(records: Sequence[FrameRecord], keyframe_indices: Sequence[int], target_dir: Path) -> None:
+def _link_or_copy(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        destination.hardlink_to(source)
+    except OSError:
+        shutil.copy2(source, destination)
+
+
+def stage_frame_subset(records: Sequence[FrameRecord], target_dir: Path, segment_names: set[str]) -> list[FrameRecord]:
     target_dir.mkdir(parents=True, exist_ok=True)
-    for index in keyframe_indices:
-        record = records[index]
-        record.is_keyframe = True
-        shutil.copy2(record.path, target_dir / record.frame_name)
+    selected = [record for record in records if record.segment in segment_names or record.is_keyframe and "keyframes" in segment_names]
+    for record in selected:
+        _link_or_copy(record.image_path, target_dir / record.frame_name)
+    return selected
 
 
 def run_command(command: list[str], cwd: Path | None = None) -> None:
@@ -303,8 +387,9 @@ def parse_points3d_txt(path: Path) -> dict[int, ColmapPoint3D]:
         parts = line.split()
         point_id = int(parts[0])
         xyz = np.array([float(parts[1]), float(parts[2]), float(parts[3])], dtype=float)
+        rgb = (int(parts[4]), int(parts[5]), int(parts[6]))
         error = float(parts[7])
-        points[point_id] = ColmapPoint3D(point_id=point_id, xyz=xyz, error=error)
+        points[point_id] = ColmapPoint3D(point_id=point_id, xyz=xyz, rgb=rgb, error=error)
     return points
 
 
@@ -354,51 +439,79 @@ def load_text_model(text_dir: Path, model_name: str) -> ParsedColmapModel:
     )
 
 
-def choose_largest_text_model(colmap_bin: str, sparse_root: Path, text_root: Path) -> ParsedColmapModel:
-    candidates = sorted(path for path in sparse_root.iterdir() if path.is_dir())
+def convert_model_to_text(colmap_bin: str, input_dir: Path, output_dir: Path) -> ParsedColmapModel:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_command(
+        [
+            colmap_bin,
+            "model_converter",
+            "--input_path",
+            str(input_dir),
+            "--output_path",
+            str(output_dir),
+            "--output_type",
+            "TXT",
+        ]
+    )
+    return load_text_model(output_dir, input_dir.name)
+
+
+def choose_largest_sparse_component(
+    colmap_bin: str,
+    sparse_candidates_root: Path,
+    text_candidates_root: Path,
+) -> tuple[ParsedColmapModel, Path, int]:
+    candidates = sorted(path for path in sparse_candidates_root.iterdir() if path.is_dir())
     if not candidates:
         raise VideoIngestError("COLMAP mapper did not produce any sparse models")
 
     best_model: ParsedColmapModel | None = None
+    best_sparse_dir: Path | None = None
     best_image_count = -1
-    text_root.mkdir(parents=True, exist_ok=True)
 
     for candidate in candidates:
-        text_dir = text_root / candidate.name
-        text_dir.mkdir(parents=True, exist_ok=True)
-        run_command(
-            [
-                colmap_bin,
-                "model_converter",
-                "--input_path",
-                str(candidate),
-                "--output_path",
-                str(text_dir),
-                "--output_type",
-                "TXT",
-            ]
-        )
-        model = load_text_model(text_dir=text_dir, model_name=candidate.name)
+        model = convert_model_to_text(colmap_bin, candidate, text_candidates_root / candidate.name)
         image_count = len(model.images_by_name)
         if image_count > best_image_count:
             best_model = model
+            best_sparse_dir = candidate
             best_image_count = image_count
 
-    if best_model is None:
-        raise VideoIngestError("failed to select a COLMAP sparse model")
-    return best_model
+    if best_model is None or best_sparse_dir is None:
+        raise VideoIngestError("failed to choose a COLMAP sparse component")
+    return best_model, best_sparse_dir, len(candidates)
 
 
 def run_colmap_pipeline(
     colmap_bin: str,
-    keyframes_dir: Path,
-    work_dir: Path,
+    frames_dir: Path,
+    records: Sequence[FrameRecord],
+    colmap_root: Path,
     capture: CaptureSpec,
-) -> ParsedColmapModel:
-    database_path = work_dir / "colmap.db"
-    sparse_root = work_dir / "sparse"
-    text_root = work_dir / "sparse_text"
-    sparse_root.mkdir(parents=True, exist_ok=True)
+) -> ColmapPipelineResult:
+    database_path = colmap_root / "database.db"
+    sparse_root = colmap_root / "sparse"
+    sparse_text_root = colmap_root / "sparse_txt"
+    staging_dir = colmap_root / "_staging"
+    mapper_candidates_dir = staging_dir / "mapper_candidates"
+    mapper_text_dir = staging_dir / "mapper_text"
+    preroll_dir = staging_dir / "preroll_images"
+    localization_dir = staging_dir / "localization_images"
+    base_model_dir = sparse_root / "base"
+    final_model_dir = sparse_root / "final"
+    base_text_dir = sparse_text_root / "base"
+    final_text_dir = sparse_text_root / "final"
+
+    for path in (sparse_root, sparse_text_root, staging_dir):
+        path.mkdir(parents=True, exist_ok=True)
+
+    preroll_records = [record for record in records if record.is_keyframe]
+    localization_records = [record for record in records if record.segment != "preroll"]
+    if not preroll_records:
+        raise VideoIngestError("no pre-roll keyframes were available for COLMAP reconstruction")
+
+    stage_frame_subset(preroll_records, preroll_dir, {"preroll", "keyframes"})
+    stage_frame_subset(localization_records, localization_dir, {"demo", "postroll"})
 
     run_command(
         [
@@ -407,7 +520,7 @@ def run_colmap_pipeline(
             "--database_path",
             str(database_path),
             "--image_path",
-            str(keyframes_dir),
+            str(frames_dir),
             "--ImageReader.camera_model",
             capture.beta.colmap.camera_model,
             "--ImageReader.single_camera",
@@ -433,12 +546,56 @@ def run_colmap_pipeline(
             "--database_path",
             str(database_path),
             "--image_path",
-            str(keyframes_dir),
+            str(preroll_dir),
             "--output_path",
-            str(sparse_root),
+            str(mapper_candidates_dir),
         ]
     )
-    return choose_largest_text_model(colmap_bin=colmap_bin, sparse_root=sparse_root, text_root=text_root)
+
+    base_model, base_sparse_candidate, component_count = choose_largest_sparse_component(
+        colmap_bin=colmap_bin,
+        sparse_candidates_root=mapper_candidates_dir,
+        text_candidates_root=mapper_text_dir,
+    )
+    if base_model_dir.exists():
+        shutil.rmtree(base_model_dir)
+    shutil.copytree(base_sparse_candidate, base_model_dir)
+    if base_text_dir.exists():
+        shutil.rmtree(base_text_dir)
+    shutil.copytree(base_model.text_dir, base_text_dir)
+    base_model = load_text_model(base_text_dir, "base")
+
+    if final_model_dir.exists():
+        shutil.rmtree(final_model_dir)
+
+    if any(localization_dir.iterdir()):
+        run_command(
+            [
+                colmap_bin,
+                "image_registrator",
+                "--database_path",
+                str(database_path),
+                "--image_path",
+                str(localization_dir),
+                "--input_path",
+                str(base_model_dir),
+                "--output_path",
+                str(final_model_dir),
+            ]
+        )
+    else:
+        shutil.copytree(base_model_dir, final_model_dir)
+
+    final_model = convert_model_to_text(colmap_bin, final_model_dir, final_text_dir)
+    return ColmapPipelineResult(
+        base_model=base_model,
+        final_model=final_model,
+        database_path=database_path,
+        sparse_root=sparse_root,
+        sparse_text_root=sparse_text_root,
+        component_count=component_count,
+        staging_dir=staging_dir,
+    )
 
 
 def camera_matrix_from_colmap(camera: ColmapCamera) -> tuple[np.ndarray, np.ndarray]:
@@ -517,32 +674,47 @@ def slerp_quaternion(start: np.ndarray, end: np.ndarray, alpha: float) -> np.nda
     return blended / np.linalg.norm(blended)
 
 
-def solve_similarity_transform(source_points: np.ndarray, target_points: np.ndarray) -> SimilarityTransform:
-    if source_points.shape != target_points.shape or source_points.shape[0] < 3:
-        raise VideoIngestError("at least three fiducial-normalized camera poses are required")
+def rotation_geodesic_deg(lhs: np.ndarray, rhs: np.ndarray) -> float:
+    delta = lhs @ rhs.T
+    trace = float(np.trace(delta))
+    cosine = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
+    return math.degrees(math.acos(cosine))
 
-    source_mean = source_points.mean(axis=0)
+
+def average_rotations(rotations: Sequence[np.ndarray]) -> np.ndarray:
+    accumulator = np.zeros((3, 3), dtype=float)
+    for rotation in rotations:
+        accumulator += rotation
+    u, _, vt = np.linalg.svd(accumulator)
+    averaged = u @ vt
+    if np.linalg.det(averaged) < 0.0:
+        u[:, -1] *= -1.0
+        averaged = u @ vt
+    return averaged
+
+
+def solve_scale_and_translation(
+    source_points: np.ndarray,
+    target_points: np.ndarray,
+    rotation: np.ndarray,
+) -> tuple[float, np.ndarray]:
+    rotated_source = (rotation @ source_points.T).T
+    source_mean = rotated_source.mean(axis=0)
     target_mean = target_points.mean(axis=0)
-    source_centered = source_points - source_mean
+    source_centered = rotated_source - source_mean
     target_centered = target_points - target_mean
-    covariance = (target_centered.T @ source_centered) / source_points.shape[0]
-    u, singular_values, vt = np.linalg.svd(covariance)
-    correction = np.eye(3)
-    if np.linalg.det(u @ vt) < 0.0:
-        correction[-1, -1] = -1.0
-    rotation = u @ correction @ vt
-    variance = np.mean(np.sum(source_centered * source_centered, axis=1))
-    if variance <= 0.0:
-        raise VideoIngestError("COLMAP camera centers were degenerate; cannot normalize to fiducial world")
-    scale = float(np.trace(np.diag(singular_values) @ correction) / variance)
-    translation = target_mean - scale * rotation @ source_mean
-    return SimilarityTransform(scale=scale, rotation=rotation, translation=translation)
+    denominator = float(np.sum(source_centered * source_centered))
+    if denominator <= 0.0:
+        raise VideoIngestError("COLMAP camera centers were degenerate; cannot solve metric scale")
+    scale = float(np.sum(source_centered * target_centered) / denominator)
+    translation = target_mean - scale * source_mean
+    return scale, translation
 
 
 def detect_fiducials(
     capture: CaptureSpec,
     model: ParsedColmapModel,
-    keyframe_map: dict[str, FrameRecord],
+    record_map: dict[str, FrameRecord],
 ) -> list[FiducialDetection]:
     import cv2  # type: ignore
 
@@ -552,11 +724,7 @@ def detect_fiducials(
     }
     dictionary = cv2.aruco.getPredefinedDictionary(dictionary_lookup[capture.fiducial.family])
     parameters = cv2.aruco.DetectorParameters()
-    detector = (
-        cv2.aruco.ArucoDetector(dictionary, parameters)
-        if hasattr(cv2.aruco, "ArucoDetector")
-        else None
-    )
+    detector = cv2.aruco.ArucoDetector(dictionary, parameters) if hasattr(cv2.aruco, "ArucoDetector") else None
     size_m = float(capture.fiducial.size_m)
     object_points = np.array(
         [
@@ -570,10 +738,10 @@ def detect_fiducials(
 
     detections: list[FiducialDetection] = []
     for frame_name, image in model.images_by_name.items():
-        frame_record = keyframe_map.get(frame_name)
+        frame_record = record_map.get(frame_name)
         if frame_record is None:
             continue
-        rgb = np.array(Image.open(frame_record.path).convert("RGB"))
+        rgb = np.array(Image.open(frame_record.image_path).convert("RGB"))
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         if detector is not None:
             corners, ids, _ = detector.detectMarkers(bgr)
@@ -597,13 +765,13 @@ def detect_fiducials(
         if not success:
             continue
         rotation_ct, _ = cv2.Rodrigues(rvec)
-        rotation_tc = rotation_ct.T
+        rotation_tc = rotation_ct.T.astype(float)
         translation_tc = (-rotation_ct.T @ tvec.reshape(3)).astype(float)
         detections.append(
             FiducialDetection(
                 frame_name=frame_name,
                 marker_id=int(ids[best_index][0]),
-                rotation_tc=rotation_tc.astype(float),
+                rotation_tc=rotation_tc,
                 translation_tc=translation_tc,
             )
         )
@@ -613,91 +781,133 @@ def detect_fiducials(
 def normalize_registered_poses(
     model: ParsedColmapModel,
     detections: Sequence[FiducialDetection],
+    fiducial_size_m: float,
 ) -> tuple[dict[str, PoseEstimate], SimilarityTransform]:
     if len(detections) < 3:
         raise VideoIngestError(
-            "fiducial normalization requires detections on at least three registered keyframes"
+            "fiducial normalization requires detections on at least three registered frames"
         )
 
-    source_points = []
-    target_points = []
+    observation_rows: list[tuple[FiducialDetection, ColmapImage, np.ndarray]] = []
     for detection in detections:
-        image = model.images_by_name[detection.frame_name]
-        source_points.append(image.world_from_camera_translation)
-        target_points.append(detection.translation_tc)
+        image = model.images_by_name.get(detection.frame_name)
+        if image is None:
+            continue
+        candidate_rotation = detection.rotation_tc @ image.world_from_camera_rotation.T
+        observation_rows.append((detection, image, candidate_rotation))
 
-    similarity = solve_similarity_transform(
-        source_points=np.vstack(source_points),
-        target_points=np.vstack(target_points),
+    if len(observation_rows) < 3:
+        raise VideoIngestError(
+            "fiducial normalization requires at least three detections with COLMAP poses"
+        )
+
+    orientation_tolerance_deg = 5.0
+    residual_tolerance_m = max(fiducial_size_m * 0.25, 0.02)
+
+    candidate_rotations = [row[2] for row in observation_rows]
+    average_rotation = average_rotations(candidate_rotations)
+    orientation_spreads = [rotation_geodesic_deg(rotation, average_rotation) for rotation in candidate_rotations]
+    rotation_inliers = [
+        row for row, spread in zip(observation_rows, orientation_spreads) if spread <= orientation_tolerance_deg
+    ]
+    if len(rotation_inliers) < 3:
+        raise VideoIngestError("fiducial orientation estimates were too inconsistent to define the world frame")
+
+    average_rotation = average_rotations([row[2] for row in rotation_inliers])
+    source_points = np.vstack([row[1].world_from_camera_translation for row in rotation_inliers])
+    target_points = np.vstack([row[0].translation_tc for row in rotation_inliers])
+    scale, translation = solve_scale_and_translation(source_points, target_points, average_rotation)
+    residuals = np.linalg.norm(
+        ((scale * (average_rotation @ source_points.T)).T + translation) - target_points,
+        axis=1,
+    )
+    residual_inliers = [row for row, residual in zip(rotation_inliers, residuals) if residual <= residual_tolerance_m]
+    if len(residual_inliers) < 3:
+        raise VideoIngestError("fiducial normalization rejected too many detections during residual filtering")
+
+    average_rotation = average_rotations([row[2] for row in residual_inliers])
+    source_points = np.vstack([row[1].world_from_camera_translation for row in residual_inliers])
+    target_points = np.vstack([row[0].translation_tc for row in residual_inliers])
+    scale, translation = solve_scale_and_translation(source_points, target_points, average_rotation)
+    final_spread = max(
+        rotation_geodesic_deg(row[2], average_rotation)
+        for row in residual_inliers
     )
 
     normalized: dict[str, PoseEstimate] = {}
     for frame_name, image in model.images_by_name.items():
         rotation_wc = image.world_from_camera_rotation
         translation_wc = image.world_from_camera_translation
-        normalized_rotation = similarity.rotation @ rotation_wc
-        normalized_translation = similarity.scale * (similarity.rotation @ translation_wc) + similarity.translation
+        normalized_rotation = average_rotation @ rotation_wc
+        normalized_translation = scale * (average_rotation @ translation_wc) + translation
         normalized[frame_name] = PoseEstimate(
             rotation_wc=normalized_rotation,
             translation_wc=normalized_translation,
             source="colmap",
+            colmap_image_id=image.image_id,
         )
+
+    similarity = SimilarityTransform(
+        scale=scale,
+        rotation=average_rotation,
+        translation=translation,
+        orientation_spread_deg=final_spread,
+        inlier_count=len(residual_inliers),
+    )
     return normalized, similarity
 
 
-def build_dense_pose_map(
+def build_pose_timeline(
     records: Sequence[FrameRecord],
     direct_pose_map: dict[str, PoseEstimate],
     max_interpolation_gap_s: float,
 ) -> dict[int, PoseEstimate]:
-    direct_indices = [
-        record.frame_index for record in records if record.frame_name in direct_pose_map
-    ]
-    if not direct_indices:
-        raise VideoIngestError("COLMAP did not register any keyframes")
-    if direct_indices[0] != 0 or direct_indices[-1] != records[-1].frame_index:
-        raise VideoIngestError(
-            "dense pose export requires the first and last extracted frames to be registered"
-        )
-
     dense: dict[int, PoseEstimate] = {}
+    direct_indices: list[int] = []
+
     for record in records:
+        record.registered = False
+        record.pose_status = "unlocalized"
+        record.colmap_image_id = None
         direct = direct_pose_map.get(record.frame_name)
-        if direct is not None:
-            dense[record.frame_index] = direct
-            record.registered = True
-            record.pose_source = "colmap"
+        if direct is None:
+            continue
+        dense[record.frame_index] = direct
+        direct_indices.append(record.frame_index)
+        record.registered = True
+        record.pose_status = "registered"
+        record.colmap_image_id = direct.colmap_image_id
 
     for start_index, end_index in zip(direct_indices, direct_indices[1:]):
+        if end_index - start_index <= 1:
+            continue
         start_record = records[start_index]
         end_record = records[end_index]
-        gap_sec = end_record.timestamp_sec - start_record.timestamp_sec
+        gap_sec = end_record.pts_sec - start_record.pts_sec
         if gap_sec > max_interpolation_gap_s:
-            raise VideoIngestError(
-                f"interpolation gap of {gap_sec:.3f}s exceeded max_interpolation_gap_s={max_interpolation_gap_s:.3f}s"
-            )
+            continue
 
         start_pose = dense[start_index]
         end_pose = dense[end_index]
         start_quaternion = rotation_matrix_to_quaternion(start_pose.rotation_wc)
         end_quaternion = rotation_matrix_to_quaternion(end_pose.rotation_wc)
+
         for frame_index in range(start_index + 1, end_index):
             record = records[frame_index]
+            if record.frame_name in direct_pose_map:
+                continue
             if gap_sec <= 1e-9:
                 alpha = 0.0
             else:
-                alpha = (record.timestamp_sec - start_record.timestamp_sec) / gap_sec
+                alpha = (record.pts_sec - start_record.pts_sec) / gap_sec
             quaternion = slerp_quaternion(start_quaternion, end_quaternion, alpha)
             dense[frame_index] = PoseEstimate(
                 rotation_wc=quaternion_to_rotation_matrix(quaternion),
                 translation_wc=((1.0 - alpha) * start_pose.translation_wc) + (alpha * end_pose.translation_wc),
                 source="interpolated",
+                colmap_image_id=None,
             )
-            record.pose_source = "interpolated"
-
-    missing_frames = [record.frame_name for record in records if record.frame_index not in dense]
-    if missing_frames:
-        raise VideoIngestError("dense pose interpolation left unresolved frames: " + ", ".join(missing_frames[:5]))
+            record.pose_status = "interpolated"
 
     return dense
 
@@ -749,15 +959,15 @@ def compute_reprojection_statistics(model: ParsedColmapModel) -> ReprojectionSta
 def make_reprojection_preview(
     output_path: Path,
     model: ParsedColmapModel,
-    keyframe_map: dict[str, FrameRecord],
+    record_map: dict[str, FrameRecord],
     max_images: int = 6,
     max_points: int = 150,
 ) -> None:
-    registered_names = [name for name in keyframe_map if name in model.images_by_name]
+    registered_names = [name for name in record_map if name in model.images_by_name]
     if not registered_names:
         placeholder = Image.new("RGB", (640, 360), color=(245, 245, 245))
         draw = ImageDraw.Draw(placeholder)
-        draw.text((24, 24), "No registered keyframes available for reprojection preview.", fill=(20, 20, 20))
+        draw.text((24, 24), "No registered frames available for reprojection preview.", fill=(20, 20, 20))
         placeholder.save(output_path, quality=90)
         return
 
@@ -770,8 +980,8 @@ def make_reprojection_preview(
     tiles: list[Image.Image] = []
     for frame_name in preview_names:
         image = model.images_by_name[frame_name]
-        frame_record = keyframe_map[frame_name]
-        tile = Image.open(frame_record.path).convert("RGB")
+        frame_record = record_map[frame_name]
+        tile = Image.open(frame_record.image_path).convert("RGB")
         draw = ImageDraw.Draw(tile)
         valid_observations = [obs for obs in image.observations if obs.point3d_id in model.points3d]
         if len(valid_observations) > max_points:
@@ -835,7 +1045,53 @@ def pose_to_matrix(rotation_wc: np.ndarray, translation_wc: np.ndarray) -> list[
     return matrix.tolist()
 
 
-def write_timestamps_csv(path: Path, records: Sequence[FrameRecord]) -> None:
+def camera_from_world_matrix(rotation_wc: np.ndarray, translation_wc: np.ndarray) -> list[list[float]]:
+    rotation_cw = rotation_wc.T
+    translation_cw = -rotation_wc.T @ translation_wc
+    matrix = np.eye(4, dtype=float)
+    matrix[:3, :3] = rotation_cw
+    matrix[:3, 3] = translation_cw
+    return matrix.tolist()
+
+
+def write_frame_index_csv(path: Path, records: Sequence[FrameRecord]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "frame_idx",
+                "frame_name",
+                "image_path",
+                "pts",
+                "pts_sec",
+                "t_ns",
+                "segment",
+                "is_keyframe",
+                "registered",
+                "pose_status",
+                "colmap_image_id",
+            ],
+        )
+        writer.writeheader()
+        for record in records:
+            writer.writerow(
+                {
+                    "frame_idx": record.frame_index,
+                    "frame_name": record.frame_name,
+                    "image_path": _path_string(record.image_path),
+                    "pts": record.pts,
+                    "pts_sec": f"{record.pts_sec:.9f}",
+                    "t_ns": record.t_ns,
+                    "segment": record.segment,
+                    "is_keyframe": str(record.is_keyframe).lower(),
+                    "registered": str(record.registered).lower(),
+                    "pose_status": record.pose_status,
+                    "colmap_image_id": "" if record.colmap_image_id is None else record.colmap_image_id,
+                }
+            )
+
+
+def write_legacy_timestamps_csv(path: Path, records: Sequence[FrameRecord]) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
@@ -847,40 +1103,114 @@ def write_timestamps_csv(path: Path, records: Sequence[FrameRecord]) -> None:
                 {
                     "frame_index": record.frame_index,
                     "frame_name": record.frame_name,
-                    "timestamp_sec": f"{record.timestamp_sec:.9f}",
+                    "timestamp_sec": f"{record.pts_sec:.9f}",
                     "is_keyframe": str(record.is_keyframe).lower(),
                     "registered": str(record.registered).lower(),
-                    "pose_source": record.pose_source,
+                    "pose_source": record.pose_status,
                 }
             )
 
 
-def write_camera_intrinsics_json(path: Path, camera: ColmapCamera) -> None:
-    path.write_text(json.dumps(colmap_intrinsics_to_json(camera), indent=2) + "\n", encoding="utf-8")
-
-
-def write_camera_poses_json(path: Path, records: Sequence[FrameRecord], dense_pose_map: dict[int, PoseEstimate]) -> None:
+def write_camera_intrinsics_json(path: Path, bundle: SpecBundle, camera: ColmapCamera) -> None:
     payload = {
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "video_id": bundle.project.video_id,
+        "camera": colmap_intrinsics_to_json(camera),
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def write_intrinsics_opencv_yaml(path: Path, camera: ColmapCamera) -> None:
+    intrinsics = colmap_intrinsics_to_json(camera)
+    payload = {
+        "camera_model": intrinsics["camera_model"],
+        "image_width": intrinsics["width_px"],
+        "image_height": intrinsics["height_px"],
+        "camera_matrix": {
+            "rows": 3,
+            "cols": 3,
+            "data": [
+                intrinsics["fx"],
+                0.0,
+                intrinsics["cx"],
+                0.0,
+                intrinsics["fy"],
+                intrinsics["cy"],
+                0.0,
+                0.0,
+                1.0,
+            ],
+        },
+        "distortion_model": "opencv",
+        "distortion_coefficients": {
+            "rows": 1,
+            "cols": 4,
+            "data": [
+                intrinsics["distortion_params"]["k1"],
+                intrinsics["distortion_params"]["k2"],
+                intrinsics["distortion_params"]["p1"],
+                intrinsics["distortion_params"]["p2"],
+            ],
+        },
+    }
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+
+def write_camera_poses_json(
+    path: Path,
+    bundle: SpecBundle,
+    records: Sequence[FrameRecord],
+    pose_map: dict[int, PoseEstimate],
+) -> None:
+    payload: dict[str, Any] = {
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "video_id": bundle.project.video_id,
         "coordinate_frame": "fiducial_world",
+        "camera_frame_convention": "COLMAP/OpenCV optical frame: +x right, +y down, +z forward",
+        "time_base": "ns_from_first_decoded_frame",
         "units": "meters",
-        "frame_count": len(records),
-        "poses": [],
+        "frames": [],
     }
     for record in records:
-        pose = dense_pose_map[record.frame_index]
-        payload["poses"].append(
-            {
-                "frame_index": record.frame_index,
-                "frame_name": record.frame_name,
-                "timestamp_sec": record.timestamp_sec,
-                "is_keyframe": record.is_keyframe,
-                "pose_source": pose.source,
-                "translation_m": pose.translation_wc.tolist(),
-                "quaternion_wxyz": rotation_matrix_to_quaternion(pose.rotation_wc).tolist(),
-                "world_from_camera_4x4": pose_to_matrix(pose.rotation_wc, pose.translation_wc),
-            }
-        )
+        pose = pose_map.get(record.frame_index)
+        entry: dict[str, Any] = {
+            "frame_idx": record.frame_index,
+            "image_path": _path_string(record.image_path),
+            "pts": record.pts,
+            "pts_sec": record.pts_sec,
+            "t_ns": record.t_ns,
+            "segment": record.segment,
+            "is_keyframe": record.is_keyframe,
+            "registered": record.registered,
+            "pose_status": record.pose_status,
+            "colmap_image_id": record.colmap_image_id,
+        }
+        if pose is not None:
+            entry["T_cw"] = camera_from_world_matrix(pose.rotation_wc, pose.translation_wc)
+            entry["T_wc"] = pose_to_matrix(pose.rotation_wc, pose.translation_wc)
+            entry["camera_center_w"] = pose.translation_wc.tolist()
+            entry["quaternion_wxyz"] = rotation_matrix_to_quaternion(pose.rotation_wc).tolist()
+        payload["frames"].append(entry)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def write_sparse_points_ply(path: Path, model: ParsedColmapModel) -> None:
+    points = list(model.points3d.values())
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("ply\n")
+        handle.write("format ascii 1.0\n")
+        handle.write(f"element vertex {len(points)}\n")
+        handle.write("property float x\n")
+        handle.write("property float y\n")
+        handle.write("property float z\n")
+        handle.write("property uchar red\n")
+        handle.write("property uchar green\n")
+        handle.write("property uchar blue\n")
+        handle.write("end_header\n")
+        for point in points:
+            handle.write(
+                f"{point.xyz[0]} {point.xyz[1]} {point.xyz[2]} {point.rgb[0]} {point.rgb[1]} {point.rgb[2]}\n"
+            )
 
 
 def build_summary(
@@ -888,22 +1218,28 @@ def build_summary(
     video_path: Path,
     decode_metadata: dict[str, Any],
     records: Sequence[FrameRecord],
-    model: ParsedColmapModel,
+    pipeline: ColmapPipelineResult,
     detections: Sequence[FiducialDetection],
     similarity: SimilarityTransform,
     reprojection_stats: ReprojectionStats,
-    dense_pose_map: dict[int, PoseEstimate],
+    pose_map: dict[int, PoseEstimate],
 ) -> dict[str, Any]:
-    keyframe_count = sum(1 for record in records if record.is_keyframe)
-    registered_keyframe_count = sum(1 for record in records if record.is_keyframe and record.registered)
-    registered_ratio = registered_keyframe_count / keyframe_count if keyframe_count else 0.0
-    interpolation_count = sum(1 for pose in dense_pose_map.values() if pose.source == "interpolated")
-    largest_gap = 0.0
+    preroll_keyframes = [record for record in records if record.segment == "preroll" and record.is_keyframe]
+    registered_preroll_keyframes = [record for record in preroll_keyframes if record.registered]
+    localized_non_preroll = [record for record in records if record.segment != "preroll" and record.registered]
+    interpolated_frames = [record for record in records if record.pose_status == "interpolated"]
+    unlocalized_frames = [record for record in records if record.pose_status == "unlocalized"]
     direct_records = [record for record in records if record.registered]
-    for earlier, later in zip(direct_records, direct_records[1:]):
-        largest_gap = max(largest_gap, later.timestamp_sec - earlier.timestamp_sec)
 
-    mismatches = []
+    largest_interpolation_gap_s = 0.0
+    for earlier, later in zip(direct_records, direct_records[1:]):
+        if later.frame_index - earlier.frame_index > 1:
+            largest_interpolation_gap_s = max(
+                largest_interpolation_gap_s,
+                later.pts_sec - earlier.pts_sec,
+            )
+
+    mismatches: list[str] = []
     if decode_metadata["width_px"] != bundle.capture.resolution.width:
         mismatches.append(
             f"decoded width {decode_metadata['width_px']}px differed from capture contract {bundle.capture.resolution.width}px"
@@ -917,8 +1253,13 @@ def build_summary(
             f"decoded nominal fps {decode_metadata['nominal_fps']:.3f} differed from capture contract {bundle.capture.fps:.3f}"
         )
 
+    registered_fraction = (
+        len(registered_preroll_keyframes) / len(preroll_keyframes) if preroll_keyframes else 0.0
+    )
     return {
+        "schema_version": PROJECT_SCHEMA_VERSION,
         "video": {
+            "id": bundle.project.video_id,
             "path": _path_string(video_path),
             "frame_count": len(records),
             "width_px": decode_metadata["width_px"],
@@ -926,53 +1267,54 @@ def build_summary(
             "nominal_fps": decode_metadata["nominal_fps"],
             "timestamp_source": decode_metadata["timestamp_source"],
         },
+        "segments": {
+            "preroll_frames": sum(1 for record in records if record.segment == "preroll"),
+            "demo_frames": sum(1 for record in records if record.segment == "demo"),
+            "postroll_frames": sum(1 for record in records if record.segment == "postroll"),
+        },
         "colmap": {
-            "selected_model": model.model_name,
-            "registered_keyframes": registered_keyframe_count,
-            "total_keyframes": keyframe_count,
-            "registered_ratio": registered_ratio,
+            "component_count": pipeline.component_count,
+            "base_registered_keyframes": len(registered_preroll_keyframes),
+            "base_total_keyframes": len(preroll_keyframes),
+            "base_registered_fraction": registered_fraction,
+            "localized_non_preroll_frames": len(localized_non_preroll),
             "mean_reprojection_error_px": reprojection_stats.mean_error_px,
             "max_reprojection_error_px": reprojection_stats.max_error_px,
             "observation_count": reprojection_stats.observation_count,
         },
         "normalization": {
             "status": "ok",
-            "world_frame": bundle.capture.beta.normalization.world_frame,
             "fiducial_family": bundle.capture.fiducial.family,
-            "detections_used": len(detections),
+            "detections_total": len(detections),
+            "detections_used": similarity.inlier_count,
             "scale_m_per_colmap_unit": similarity.scale,
+            "orientation_spread_deg": similarity.orientation_spread_deg,
         },
         "pose_coverage": {
-            "total_frames": len(records),
-            "registered_frames": sum(1 for record in records if record.registered),
-            "interpolated_frames": interpolation_count,
-            "largest_interpolation_gap_s": largest_gap,
-            "edge_coverage_ok": records[0].registered and records[-1].registered,
+            "direct_registered_frames": len(direct_records),
+            "interpolated_frames": len(interpolated_frames),
+            "unlocalized_frames": len(unlocalized_frames),
+            "pose_entries": len(pose_map),
+            "largest_interpolation_gap_s": largest_interpolation_gap_s,
         },
         "capture_contract_mismatches": mismatches,
     }
 
 
 def enforce_stability_thresholds(bundle: SpecBundle, summary: dict[str, Any]) -> None:
+    acceptance = bundle.project.acceptance
     colmap_summary = summary["colmap"]
-    thresholds = bundle.capture.beta.colmap
-    if colmap_summary["registered_keyframes"] < thresholds.min_registered_keyframes:
+    if colmap_summary["base_registered_keyframes"] < acceptance.beta_min_registered_keyframes:
         raise VideoIngestError(
-            f"registered keyframes {colmap_summary['registered_keyframes']} fell below min_registered_keyframes={thresholds.min_registered_keyframes}"
+            f"registered pre-roll keyframes {colmap_summary['base_registered_keyframes']} fell below beta_min_registered_keyframes={acceptance.beta_min_registered_keyframes}"
         )
-    if colmap_summary["registered_ratio"] < thresholds.min_registered_ratio:
+    if colmap_summary["base_registered_fraction"] < acceptance.beta_min_registered_fraction:
         raise VideoIngestError(
-            f"registered ratio {colmap_summary['registered_ratio']:.3f} fell below min_registered_ratio={thresholds.min_registered_ratio:.3f}"
+            f"registered pre-roll fraction {colmap_summary['base_registered_fraction']:.3f} fell below beta_min_registered_fraction={acceptance.beta_min_registered_fraction:.3f}"
         )
-    if colmap_summary["mean_reprojection_error_px"] > thresholds.max_mean_reprojection_error_px:
+    if colmap_summary["mean_reprojection_error_px"] > acceptance.beta_max_mean_reprojection_error_px:
         raise VideoIngestError(
-            f"mean reprojection error {colmap_summary['mean_reprojection_error_px']:.3f}px exceeded max_mean_reprojection_error_px={thresholds.max_mean_reprojection_error_px:.3f}px"
-        )
-    if not summary["pose_coverage"]["edge_coverage_ok"]:
-        raise VideoIngestError("pose coverage did not include the first and last extracted frames")
-    if summary["pose_coverage"]["largest_interpolation_gap_s"] > thresholds.max_interpolation_gap_s:
-        raise VideoIngestError(
-            f"largest interpolation gap {summary['pose_coverage']['largest_interpolation_gap_s']:.3f}s exceeded max_interpolation_gap_s={thresholds.max_interpolation_gap_s:.3f}s"
+            f"mean reprojection error {colmap_summary['mean_reprojection_error_px']:.3f}px exceeded beta_max_mean_reprojection_error_px={acceptance.beta_max_mean_reprojection_error_px:.3f}px"
         )
 
 
@@ -985,10 +1327,15 @@ def ingest_monocular_video(
 ) -> IngestResult:
     out_dir.mkdir(parents=True, exist_ok=True)
     frames_dir = out_dir / "frames"
-    work_dir = out_dir / "_workdir"
-    keyframes_dir = work_dir / "keyframes"
+    calibration_dir = out_dir / "calibration"
+    colmap_root = out_dir / "colmap"
+    camera_dir = out_dir / "camera"
+    scene_dir = out_dir / "scene"
     preview_path = out_dir / "reprojection_preview.jpg"
     summary_path = out_dir / "reconstruction_summary.json"
+
+    for path in (calibration_dir, colmap_root, camera_dir, scene_dir):
+        path.mkdir(parents=True, exist_ok=True)
 
     colmap_binary = ensure_beta_dependencies(colmap_bin)
     records, decode_metadata = decode_video_to_frames(
@@ -996,51 +1343,67 @@ def ingest_monocular_video(
         frames_dir=frames_dir,
         image_format=bundle.capture.beta.frame_extraction.image_format,
     )
+    assign_frame_segments(
+        records=records,
+        preroll_seconds=bundle.project.capture.preroll_seconds,
+        postroll_seconds=bundle.project.capture.postroll_seconds,
+    )
     keyframe_indices = select_keyframe_indices(
         records=records,
         sample_fps=bundle.capture.beta.frame_extraction.keyframe_sample_fps,
+        segment="preroll",
     )
-    copy_keyframes(records=records, keyframe_indices=keyframe_indices, target_dir=keyframes_dir)
+    for index in keyframe_indices:
+        records[index].is_keyframe = True
 
-    summary: dict[str, Any] | None = None
-    try:
-        model = run_colmap_pipeline(
-            colmap_bin=colmap_binary,
-            keyframes_dir=keyframes_dir,
-            work_dir=work_dir,
-            capture=bundle.capture,
-        )
-        direct_keyframe_map = {record.frame_name: record for record in records if record.is_keyframe}
-        detections = detect_fiducials(capture=bundle.capture, model=model, keyframe_map=direct_keyframe_map)
-        normalized_pose_map, similarity = normalize_registered_poses(model=model, detections=detections)
-        dense_pose_map = build_dense_pose_map(
-            records=records,
-            direct_pose_map=normalized_pose_map,
-            max_interpolation_gap_s=bundle.capture.beta.colmap.max_interpolation_gap_s,
-        )
-        reprojection_stats = compute_reprojection_statistics(model=model)
-        make_reprojection_preview(output_path=preview_path, model=model, keyframe_map=direct_keyframe_map)
+    pipeline = run_colmap_pipeline(
+        colmap_bin=colmap_binary,
+        frames_dir=frames_dir,
+        records=records,
+        colmap_root=colmap_root,
+        capture=bundle.capture,
+    )
+    record_map = {record.frame_name: record for record in records}
+    detections = detect_fiducials(capture=bundle.capture, model=pipeline.final_model, record_map=record_map)
+    normalized_pose_map, similarity = normalize_registered_poses(
+        model=pipeline.final_model,
+        detections=detections,
+        fiducial_size_m=bundle.capture.fiducial.size_m,
+    )
+    pose_map = build_pose_timeline(
+        records=records,
+        direct_pose_map=normalized_pose_map,
+        max_interpolation_gap_s=bundle.capture.beta.colmap.max_interpolation_gap_s,
+    )
+    reprojection_stats = compute_reprojection_statistics(model=pipeline.final_model)
+    make_reprojection_preview(output_path=preview_path, model=pipeline.final_model, record_map=record_map)
 
-        camera = next(iter(model.cameras.values()))
-        write_timestamps_csv(out_dir / "timestamps.csv", records)
-        write_camera_intrinsics_json(out_dir / "camera_intrinsics.json", camera)
-        write_camera_poses_json(out_dir / "camera_poses.json", records, dense_pose_map)
+    camera = next(iter(pipeline.final_model.cameras.values()))
+    frame_index_path = frames_dir / "index.csv"
+    write_frame_index_csv(frame_index_path, records)
+    write_legacy_timestamps_csv(out_dir / "timestamps.csv", records)
+    write_intrinsics_opencv_yaml(calibration_dir / "intrinsics_opencv.yaml", camera)
+    write_camera_intrinsics_json(camera_dir / "intrinsics.json", bundle, camera)
+    write_camera_intrinsics_json(out_dir / "camera_intrinsics.json", bundle, camera)
+    write_camera_poses_json(camera_dir / "camera_poses.json", bundle, records, pose_map)
+    write_camera_poses_json(out_dir / "camera_poses.json", bundle, records, pose_map)
+    write_sparse_points_ply(scene_dir / "sparse_points.ply", pipeline.final_model)
 
-        summary = build_summary(
-            bundle=bundle,
-            video_path=video_path,
-            decode_metadata=decode_metadata,
-            records=records,
-            model=model,
-            detections=detections,
-            similarity=similarity,
-            reprojection_stats=reprojection_stats,
-            dense_pose_map=dense_pose_map,
-        )
-        summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-        enforce_stability_thresholds(bundle=bundle, summary=summary)
-        return IngestResult(frame_records=records, summary=summary)
-    finally:
-        if not keep_workdir and work_dir.exists():
-            shutil.rmtree(work_dir, ignore_errors=True)
+    summary = build_summary(
+        bundle=bundle,
+        video_path=video_path,
+        decode_metadata=decode_metadata,
+        records=records,
+        pipeline=pipeline,
+        detections=detections,
+        similarity=similarity,
+        reprojection_stats=reprojection_stats,
+        pose_map=pose_map,
+    )
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    enforce_stability_thresholds(bundle=bundle, summary=summary)
 
+    if not keep_workdir and pipeline.staging_dir.exists():
+        shutil.rmtree(pipeline.staging_dir, ignore_errors=True)
+
+    return IngestResult(frame_records=list(records), summary=summary)

@@ -1,0 +1,12 @@
+schema_version: 0.1.0
+ontology_name: tabletop_pick_place_v1
+entities:
+  - id: target_object
+    kind: object
+    label: red cube
+  - id: receptacle
+    kind: object
+    label: black tray
+  - id: tabletop
+    kind: surface
+    label: tabletop

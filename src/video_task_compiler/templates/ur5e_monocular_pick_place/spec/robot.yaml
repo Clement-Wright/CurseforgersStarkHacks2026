@@ -39,4 +39,3 @@ action_space:
     min: 0.0
     max: 0.085
 control_rate_hz: 20
-

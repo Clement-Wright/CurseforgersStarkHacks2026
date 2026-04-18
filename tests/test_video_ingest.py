@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
 import shutil
 import subprocess
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -12,23 +14,26 @@ from video_task_compiler.video_ingest import (
     ColmapImage,
     DecodedFrame,
     FiducialDetection,
+    FrameRecord,
     ParsedColmapModel,
-    ReprojectionStats,
-    build_dense_pose_map,
+    PoseEstimate,
     compute_reprojection_statistics,
     extract_frames_from_source,
     normalize_registered_poses,
     parse_cameras_txt,
     parse_images_txt,
     parse_points3d_txt,
-    rotation_matrix_to_quaternion,
+    relative_timestamp_ns,
     select_keyframe_indices,
+    timestamp_seconds_from_pts,
+    assign_frame_segments,
+    build_pose_timeline,
 )
 
 
 def test_extract_frames_from_source_writes_dense_frames(tmp_path: Path) -> None:
     decoded_frames = [
-        DecodedFrame(index=index, timestamp_sec=index * 0.25, rgb=np.full((6, 6, 3), 40 * index, dtype=np.uint8))
+        DecodedFrame(index=index, pts=index * 10, pts_sec=index * 0.25, t_ns=index * 250_000_000, rgb=np.full((6, 6, 3), 40 * index, dtype=np.uint8))
         for index in range(4)
     ]
 
@@ -40,17 +45,45 @@ def test_extract_frames_from_source_writes_dense_frames(tmp_path: Path) -> None:
         "frame_000002.png",
         "frame_000003.png",
     ]
-    assert records[2].timestamp_sec == pytest.approx(0.5)
-    assert all(record.path.exists() for record in records)
+    assert records[2].pts == 20
+    assert records[2].pts_sec == pytest.approx(0.5)
+    assert records[2].t_ns == 500_000_000
+    assert all(record.image_path.exists() for record in records)
 
 
-def test_select_keyframe_indices_forces_first_and_last() -> None:
+def test_timestamp_helpers_preserve_nanosecond_contract() -> None:
+    absolute_sec = timestamp_seconds_from_pts(90, Fraction(1, 30))
+    t_ns = relative_timestamp_ns(absolute_sec, 2.0)
+
+    assert absolute_sec == pytest.approx(3.0)
+    assert t_ns == 1_000_000_000
+
+
+def test_assign_frame_segments_splits_preroll_demo_and_postroll() -> None:
     records = [
-        type("Frame", (), {"timestamp_sec": ts})()
-        for ts in (0.0, 0.2, 0.4, 0.6, 0.8)
+        FrameRecord(index, f"frame_{index:06d}.png", index, ts, int(ts * 1_000_000_000), Path(f"frame_{index:06d}.png"))
+        for index, ts in enumerate((0.0, 5.0, 10.0, 12.0, 14.0, 16.0))
     ]
 
-    indices = select_keyframe_indices(records, sample_fps=2.0)
+    assign_frame_segments(records, preroll_seconds=10.0, postroll_seconds=2.0)
+
+    assert [record.segment for record in records] == [
+        "preroll",
+        "preroll",
+        "preroll",
+        "demo",
+        "postroll",
+        "postroll",
+    ]
+
+
+def test_select_keyframe_indices_forces_first_and_last_preroll_frame() -> None:
+    records = [
+        FrameRecord(index, f"frame_{index:06d}.png", index, ts, int(ts * 1_000_000_000), Path(f"frame_{index:06d}.png"), segment="preroll")
+        for index, ts in enumerate((0.0, 0.2, 0.4, 0.6, 0.8))
+    ]
+
+    indices = select_keyframe_indices(records, sample_fps=2.0, segment="preroll")
 
     assert indices[0] == 0
     assert indices[-1] == 4
@@ -79,75 +112,56 @@ def test_parse_colmap_text_files(tmp_path: Path) -> None:
     assert cameras[1].model == "OPENCV"
     assert images["frame_000000.png"].camera_id == 1
     assert images["frame_000000.png"].observations[0].point3d_id == 7
+    assert points[7].rgb == (255, 255, 255)
     assert points[7].error == pytest.approx(0.25)
 
 
-def _make_direct_pose_records() -> tuple[list, dict[str, object]]:
-    records = []
-    for index, ts in enumerate((0.0, 0.25, 0.5, 0.75, 1.0)):
-        records.append(
-            type(
-                "FrameRecordLike",
-                (),
-                {
-                    "frame_index": index,
-                    "frame_name": f"frame_{index:06d}.png",
-                    "timestamp_sec": ts,
-                    "registered": False,
-                    "pose_source": "missing",
-                },
-            )()
-        )
-    return records
-
-
-def test_build_dense_pose_map_interpolates_interior_frames() -> None:
-    from video_task_compiler.video_ingest import PoseEstimate
-
-    records = _make_direct_pose_records()
+def test_build_pose_timeline_interpolates_internal_gaps_and_leaves_edges_unlocalized() -> None:
+    records = [
+        FrameRecord(index, f"frame_{index:06d}.png", index, ts, int(ts * 1_000_000_000), Path(f"frame_{index:06d}.png"))
+        for index, ts in enumerate((0.0, 0.25, 0.5, 0.75, 1.0))
+    ]
     direct_pose_map = {
-        "frame_000000.png": PoseEstimate(rotation_wc=np.eye(3), translation_wc=np.array([0.0, 0.0, 0.0]), source="colmap"),
-        "frame_000002.png": PoseEstimate(rotation_wc=np.eye(3), translation_wc=np.array([1.0, 0.0, 0.0]), source="colmap"),
-        "frame_000004.png": PoseEstimate(rotation_wc=np.eye(3), translation_wc=np.array([2.0, 0.0, 0.0]), source="colmap"),
+        "frame_000001.png": PoseEstimate(rotation_wc=np.eye(3), translation_wc=np.array([0.0, 0.0, 0.0]), source="colmap", colmap_image_id=11),
+        "frame_000003.png": PoseEstimate(rotation_wc=np.eye(3), translation_wc=np.array([1.0, 0.0, 0.0]), source="colmap", colmap_image_id=13),
     }
 
-    dense = build_dense_pose_map(records, direct_pose_map, max_interpolation_gap_s=1.0)
+    dense = build_pose_timeline(records, direct_pose_map, max_interpolation_gap_s=1.0)
 
-    assert dense[1].source == "interpolated"
-    assert dense[1].translation_wc[0] == pytest.approx(0.5)
-    assert dense[3].translation_wc[0] == pytest.approx(1.5)
+    assert records[0].pose_status == "unlocalized"
+    assert records[1].registered is True
+    assert records[2].pose_status == "interpolated"
+    assert records[4].pose_status == "unlocalized"
+    assert dense[2].translation_wc[0] == pytest.approx(0.5)
 
 
-def test_build_dense_pose_map_rejects_large_gap() -> None:
-    from video_task_compiler.video_ingest import PoseEstimate, VideoIngestError
-
-    records = []
-    for index, ts in enumerate((0.0, 1.5, 3.0)):
-        records.append(
-            type(
-                "FrameRecordLike",
-                (),
-                {
-                    "frame_index": index,
-                    "frame_name": f"frame_{index:06d}.png",
-                    "timestamp_sec": ts,
-                    "registered": False,
-                    "pose_source": "missing",
-                },
-            )()
-        )
+def test_build_pose_timeline_skips_large_internal_gaps() -> None:
+    records = [
+        FrameRecord(index, f"frame_{index:06d}.png", index, ts, int(ts * 1_000_000_000), Path(f"frame_{index:06d}.png"))
+        for index, ts in enumerate((0.0, 1.0, 2.5, 4.0))
+    ]
     direct_pose_map = {
-        "frame_000000.png": PoseEstimate(rotation_wc=np.eye(3), translation_wc=np.array([0.0, 0.0, 0.0]), source="colmap"),
-        "frame_000001.png": PoseEstimate(rotation_wc=np.eye(3), translation_wc=np.array([1.0, 0.0, 0.0]), source="colmap"),
-        "frame_000002.png": PoseEstimate(rotation_wc=np.eye(3), translation_wc=np.array([2.0, 0.0, 0.0]), source="colmap"),
+        "frame_000000.png": PoseEstimate(rotation_wc=np.eye(3), translation_wc=np.array([0.0, 0.0, 0.0]), source="colmap", colmap_image_id=1),
+        "frame_000003.png": PoseEstimate(rotation_wc=np.eye(3), translation_wc=np.array([3.0, 0.0, 0.0]), source="colmap", colmap_image_id=4),
     }
 
-    with pytest.raises(VideoIngestError):
-        build_dense_pose_map(records, direct_pose_map, max_interpolation_gap_s=1.0)
+    dense = build_pose_timeline(records, direct_pose_map, max_interpolation_gap_s=1.0)
+
+    assert set(dense.keys()) == {0, 3}
+    assert records[1].pose_status == "unlocalized"
+    assert records[2].pose_status == "unlocalized"
 
 
-def test_normalize_registered_poses_solves_metric_similarity() -> None:
+def test_normalize_registered_poses_uses_fiducial_orientation() -> None:
     q_identity = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+    rotation_z_90 = np.array(
+        [
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
     model = ParsedColmapModel(
         model_name="0",
         text_dir=Path("."),
@@ -168,15 +182,17 @@ def test_normalize_registered_poses_solves_metric_similarity() -> None:
         points3d={},
     )
     detections = [
-        FiducialDetection("frame_000000.png", 1, np.eye(3), np.array([1.0, 1.0, 0.0])),
-        FiducialDetection("frame_000001.png", 1, np.eye(3), np.array([3.0, 1.0, 0.0])),
-        FiducialDetection("frame_000002.png", 1, np.eye(3), np.array([3.0, 3.0, 0.0])),
+        FiducialDetection("frame_000000.png", 1, rotation_z_90, np.array([1.0, 1.0, 0.0])),
+        FiducialDetection("frame_000001.png", 1, rotation_z_90, np.array([1.0, 3.0, 0.0])),
+        FiducialDetection("frame_000002.png", 1, rotation_z_90, np.array([-1.0, 3.0, 0.0])),
     ]
 
-    normalized, similarity = normalize_registered_poses(model, detections)
+    normalized, similarity = normalize_registered_poses(model, detections, fiducial_size_m=0.06)
 
     assert similarity.scale == pytest.approx(2.0)
-    assert normalized["frame_000001.png"].translation_wc.tolist() == pytest.approx([3.0, 1.0, 0.0])
+    assert np.allclose(similarity.rotation, rotation_z_90)
+    assert normalized["frame_000001.png"].translation_wc.tolist() == pytest.approx([1.0, 3.0, 0.0])
+    assert np.allclose(normalized["frame_000001.png"].rotation_wc, rotation_z_90)
 
 
 def test_compute_reprojection_statistics_returns_finite_error() -> None:
@@ -205,7 +221,7 @@ def test_compute_reprojection_statistics_returns_finite_error() -> None:
         points3d={},
     )
     point_world = np.array([0.0, 0.0, 2.0], dtype=float)
-    model.points3d[7] = type("Point", (), {"xyz": point_world, "error": 0.0})()
+    model.points3d[7] = type("Point", (), {"xyz": point_world, "rgb": (255, 255, 255), "error": 0.0})()
     model.images_by_name["frame_000000.png"].observations.append(type("Obs", (), {"x": 320.0, "y": 240.0, "point3d_id": 7})())
 
     stats = compute_reprojection_statistics(model)
@@ -214,7 +230,10 @@ def test_compute_reprojection_statistics_returns_finite_error() -> None:
     assert stats.mean_error_px == pytest.approx(0.0)
 
 
-@pytest.mark.skipif(shutil.which("colmap") is None, reason="colmap not installed")
-def test_colmap_binary_smoke() -> None:
+@pytest.mark.skipif(
+    shutil.which("colmap") is None or importlib.util.find_spec("av") is None,
+    reason="colmap or av not installed",
+)
+def test_colmap_and_pyav_smoke() -> None:
     result = subprocess.run(["colmap", "help"], capture_output=True, text=True)
     assert result.returncode == 0

@@ -1,0 +1,41 @@
+schema_version: 0.1.0
+project_name: monocular_video_to_robot_frontend
+video_id: demo_0001
+sample_raw_video: video/raw/demo_0001.mp4
+task_name: pick_and_place_single_object
+demo_owner: robotics-team
+artifact_owners:
+  alpha: tech-lead
+  beta: sfm-lead
+  gamma: perception-lead
+  delta: simulation-lead
+  deployment: controls-lead
+robot_target_id: ur5e_robotiq_2f85
+capture:
+  require_static_preroll: true
+  preroll_seconds: 10.0
+  postroll_seconds: 0.0
+  operator_count: 1
+coord_frames:
+  project_world: W
+  robot_base: Br
+  camera_optical: Ci
+time:
+  origin: first_decoded_frame
+  base_unit: ns
+world_frame_policy: fiducial_center
+metric_scale_policy: fiducial_marker
+ontology:
+  target_object_id: target_object
+  receptacle_object_id: receptacle
+  support_surface_id: tabletop
+sponsor_resources:
+  - rgb_monocular_capture
+  - colmap_gpu_node
+  - ur5e_workcell
+acceptance:
+  beta_min_registered_fraction: 0.7
+  beta_min_registered_keyframes: 20
+  beta_max_mean_reprojection_error_px: 1.5
+  gamma_max_id_switches: 1
+  delta_min_mask_iou_sample: 0.8

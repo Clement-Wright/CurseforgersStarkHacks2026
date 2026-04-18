@@ -52,18 +52,25 @@ def spec_init(
         dir_okay=True,
         writable=True,
         resolve_path=True,
-        help="Directory that will receive robot.yaml, task.yaml, and capture.yaml.",
+        help="Bundle root that will receive spec/, env/, and checklists/.",
     ),
 ) -> None:
     """Create a new alpha spec bundle from the built-in template."""
     template_dir = _template_dir(template)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for name in ("robot.yaml", "task.yaml", "capture.yaml"):
-        destination = output_dir / name
+    template_files = [path for path in template_dir.rglob("*") if path.is_file()]
+    for source in template_files:
+        relative_path = source.relative_to(template_dir)
+        destination = output_dir / relative_path
         if destination.exists():
             raise typer.BadParameter(f"refusing to overwrite existing file: {destination}")
-        shutil.copyfile(template_dir / name, destination)
+
+    for source in template_files:
+        relative_path = source.relative_to(template_dir)
+        destination = output_dir / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
 
     typer.echo(f"initialized template '{template}' in {output_dir}")
 
@@ -78,7 +85,7 @@ def spec_validate(
         dir_okay=True,
         readable=True,
         resolve_path=True,
-        help="Directory that contains robot.yaml, task.yaml, and capture.yaml.",
+        help="Bundle root or spec/ directory for the contract bundle.",
     )
 ) -> None:
     """Validate a spec bundle and exit non-zero on failure."""
@@ -124,7 +131,7 @@ def ingest_monocular(
         dir_okay=True,
         readable=True,
         resolve_path=True,
-        help="Directory that contains the validated robot.yaml, task.yaml, and capture.yaml bundle.",
+        help="Bundle root or spec/ directory for the validated contract bundle.",
     ),
     video: Path = typer.Option(
         ...,
@@ -156,7 +163,7 @@ def ingest_monocular(
         help="Keep raw COLMAP work artifacts under the output directory.",
     ),
 ) -> None:
-    """Decode a monocular demo video, calibrate it with COLMAP, and export dense poses."""
+    """Decode a monocular demo video, reconstruct pre-roll geometry, and export normalized poses."""
     try:
         bundle = load_bundle(spec_dir)
         validate_bundle(bundle)

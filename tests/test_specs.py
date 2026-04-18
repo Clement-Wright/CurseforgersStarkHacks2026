@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from copy import deepcopy
 from pathlib import Path
 
@@ -9,109 +10,103 @@ import yaml
 from video_task_compiler.specs import SpecValidationError, load_bundle, validate_bundle
 
 
-def _write_bundle(target_dir: Path, robot: dict, task: dict, capture: dict) -> None:
-    target_dir.mkdir(parents=True, exist_ok=True)
-    (target_dir / "robot.yaml").write_text(yaml.safe_dump(robot, sort_keys=False), encoding="utf-8")
-    (target_dir / "task.yaml").write_text(yaml.safe_dump(task, sort_keys=False), encoding="utf-8")
-    (target_dir / "capture.yaml").write_text(yaml.safe_dump(capture, sort_keys=False), encoding="utf-8")
+def _copy_bundle_root(target_root: Path) -> Path:
+    for name in ("spec", "env", "checklists"):
+        shutil.copytree(Path(name), target_root / name)
+    return target_root
 
 
-@pytest.fixture()
-def example_bundle_dicts() -> tuple[dict, dict, dict]:
-    robot = yaml.safe_load(Path("spec/robot.yaml").read_text(encoding="utf-8"))
-    task = yaml.safe_load(Path("spec/task.yaml").read_text(encoding="utf-8"))
-    capture = yaml.safe_load(Path("spec/capture.yaml").read_text(encoding="utf-8"))
-    return robot, task, capture
+def _load_yaml(path: Path) -> dict:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
-def test_checked_in_bundle_validates(example_bundle_dicts: tuple[dict, dict, dict], tmp_path: Path) -> None:
-    robot, task, capture = example_bundle_dicts
-    _write_bundle(tmp_path, robot, task, capture)
-
-    bundle = load_bundle(tmp_path)
-    validated = validate_bundle(bundle)
-
-    assert validated.robot.robot_id == "ur5e_robotiq_2f85"
-    assert validated.task.family == "pick_place"
-    assert validated.capture.scale_source == "fiducial"
-    assert validated.capture.beta.colmap.camera_model == "OPENCV"
+def _write_yaml(path: Path, payload: dict) -> None:
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
 
-def test_missing_required_field_reports_targeted_error(
-    example_bundle_dicts: tuple[dict, dict, dict], tmp_path: Path
-) -> None:
-    robot, task, capture = example_bundle_dicts
-    broken_task = deepcopy(task)
-    del broken_task["language_prompt"]
-    _write_bundle(tmp_path, robot, broken_task, capture)
+def test_checked_in_bundle_validates() -> None:
+    bundle = validate_bundle(load_bundle(Path("spec")))
+
+    assert bundle.project.capture.preroll_seconds == pytest.approx(10.0)
+    assert bundle.task.pick_object.ontology_id == "target_object"
+    assert bundle.capture.beta.normalization.world_frame == "fiducial_center"
+    assert bundle.env_specs["sfm"].name == "video-task-compiler-sfm"
+
+
+def test_missing_project_file_reports_targeted_error(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    (bundle_root / "spec" / "project.yaml").unlink()
 
     with pytest.raises(SpecValidationError) as excinfo:
-        load_bundle(tmp_path)
+        load_bundle(bundle_root / "spec")
 
-    assert any(issue.field_path == "language_prompt" for issue in excinfo.value.issues)
-
-
-def test_wrong_robot_id_is_rejected(example_bundle_dicts: tuple[dict, dict, dict], tmp_path: Path) -> None:
-    robot, task, capture = example_bundle_dicts
-    broken_task = deepcopy(task)
-    broken_task["robot_id"] = "another_robot"
-    _write_bundle(tmp_path, robot, broken_task, capture)
-
-    with pytest.raises(SpecValidationError) as excinfo:
-        validate_bundle(load_bundle(tmp_path))
-
-    assert any("must match robot.robot_id" in issue.reason for issue in excinfo.value.issues)
+    assert any(issue.file_path.endswith("project.yaml") for issue in excinfo.value.issues)
+    assert any("missing required file" in issue.reason for issue in excinfo.value.issues)
 
 
-def test_non_fiducial_monocular_scale_is_rejected(
-    example_bundle_dicts: tuple[dict, dict, dict], tmp_path: Path
-) -> None:
-    robot, task, capture = example_bundle_dicts
-    broken_capture = deepcopy(capture)
-    broken_capture["scale_source"] = "known_object"
-    _write_bundle(tmp_path, robot, task, broken_capture)
+def test_missing_environment_file_is_rejected(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    (bundle_root / "env" / "human.environment.yml").unlink()
 
     with pytest.raises(SpecValidationError) as excinfo:
-        validate_bundle(load_bundle(tmp_path))
+        load_bundle(bundle_root / "spec")
 
-    assert any(issue.field_path == "scale_source" for issue in excinfo.value.issues)
-
-
-def test_unsupported_action_space_is_rejected(
-    example_bundle_dicts: tuple[dict, dict, dict], tmp_path: Path
-) -> None:
-    robot, task, capture = example_bundle_dicts
-    broken_robot = deepcopy(robot)
-    broken_robot["action_space"]["arm_dof"] = 7
-    _write_bundle(tmp_path, broken_robot, task, capture)
-
-    with pytest.raises(SpecValidationError) as excinfo:
-        validate_bundle(load_bundle(tmp_path))
-
-    assert any(issue.field_path == "action_space.arm_dof" for issue in excinfo.value.issues)
+    assert any(issue.file_path.endswith("human.environment.yml") for issue in excinfo.value.issues)
 
 
-def test_task_regions_must_stay_inside_workspace(
-    example_bundle_dicts: tuple[dict, dict, dict], tmp_path: Path
-) -> None:
-    robot, task, capture = example_bundle_dicts
-    broken_task = deepcopy(task)
-    broken_task["place_region"]["target_region_m"]["max_m"]["x"] = 1.2
-    _write_bundle(tmp_path, robot, broken_task, capture)
+def test_ontology_mismatch_is_rejected(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    task_path = bundle_root / "spec" / "task.yaml"
+    task_data = _load_yaml(task_path)
+    task_data["pick_object"]["ontology_id"] = "missing_object"
+    _write_yaml(task_path, task_data)
 
     with pytest.raises(SpecValidationError) as excinfo:
-        validate_bundle(load_bundle(tmp_path))
+        validate_bundle(load_bundle(bundle_root))
+
+    assert any("ontology id 'missing_object' was not defined" in issue.reason for issue in excinfo.value.issues)
+
+
+def test_project_world_policy_must_match_capture_normalization(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    project_path = bundle_root / "spec" / "project.yaml"
+    project_data = _load_yaml(project_path)
+    project_data["world_frame_policy"] = "fiducial_center"
+    project_data["metric_scale_policy"] = "fiducial_marker"
+    project_data["coord_frames"]["project_world"] = "W"
+    _write_yaml(project_path, project_data)
+
+    capture_path = bundle_root / "spec" / "capture.yaml"
+    capture_data = _load_yaml(capture_path)
+    capture_data["beta"]["normalization"]["world_frame"] = "fiducial_center"
+    _write_yaml(capture_path, capture_data)
+
+    validated = validate_bundle(load_bundle(bundle_root))
+    assert validated.project.world_frame_policy == "fiducial_center"
+
+
+def test_env_files_must_pin_python_310(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    env_path = bundle_root / "env" / "sfm.environment.yml"
+    env_data = _load_yaml(env_path)
+    env_data["dependencies"][0] = "python=3.11"
+    _write_yaml(env_path, env_data)
+
+    with pytest.raises(SpecValidationError) as excinfo:
+        validate_bundle(load_bundle(bundle_root / "spec"))
+
+    assert any(issue.file_path.endswith("sfm.environment.yml") for issue in excinfo.value.issues)
+    assert any("python=3.10" in issue.reason for issue in excinfo.value.issues)
+
+
+def test_task_regions_must_stay_inside_workspace(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    task_path = bundle_root / "spec" / "task.yaml"
+    task_data = deepcopy(_load_yaml(task_path))
+    task_data["place_region"]["target_region_m"]["max_m"]["x"] = 1.2
+    _write_yaml(task_path, task_data)
+
+    with pytest.raises(SpecValidationError) as excinfo:
+        validate_bundle(load_bundle(bundle_root))
 
     assert any(issue.field_path == "place_region.target_region_m" for issue in excinfo.value.issues)
-
-
-def test_beta_camera_model_is_rejected(example_bundle_dicts: tuple[dict, dict, dict], tmp_path: Path) -> None:
-    robot, task, capture = example_bundle_dicts
-    broken_capture = deepcopy(capture)
-    broken_capture["beta"]["colmap"]["camera_model"] = "PINHOLE"
-    _write_bundle(tmp_path, robot, task, broken_capture)
-
-    with pytest.raises(SpecValidationError) as excinfo:
-        validate_bundle(load_bundle(tmp_path))
-
-    assert any(issue.field_path == "beta.colmap.camera_model" for issue in excinfo.value.issues)

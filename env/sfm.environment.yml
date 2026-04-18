@@ -1,8 +1,13 @@
-name: video-task-compiler-dev
+name: video-task-compiler-sfm
 channels:
   - conda-forge
 dependencies:
   - python=3.10
   - pip
+  - numpy
+  - pillow
+  - pyyaml
+  - typer
   - pip:
       - -e .[dev]
+      - av>=13,<15

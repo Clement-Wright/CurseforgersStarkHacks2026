@@ -1,0 +1,10 @@
+name: video-task-compiler-objects
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pip:
+      - torch
+      - torchvision

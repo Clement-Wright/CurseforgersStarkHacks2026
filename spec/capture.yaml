@@ -32,9 +32,6 @@ beta:
   colmap:
     camera_model: OPENCV
     matcher: sequential
-    min_registered_keyframes: 20
-    min_registered_ratio: 0.7
-    max_mean_reprojection_error_px: 2.0
     max_interpolation_gap_s: 1.0
   normalization:
     world_frame: fiducial_center

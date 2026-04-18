@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,7 @@ from video_task_compiler.cli import app
 from video_task_compiler.video_ingest import (
     ColmapCamera,
     ColmapImage,
+    ColmapPipelineResult,
     DecodedFrame,
     FiducialDetection,
     ParsedColmapModel,
@@ -24,6 +26,20 @@ from video_task_compiler.video_ingest import (
 runner = CliRunner()
 
 
+def _copy_bundle_root(target_root: Path) -> Path:
+    for name in ("spec", "env", "checklists"):
+        shutil.copytree(Path(name), target_root / name)
+    return target_root
+
+
+def _load_yaml(path: Path) -> dict:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def _write_yaml(path: Path, payload: dict) -> None:
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+
 def test_validate_command_succeeds_for_checked_in_template() -> None:
     result = runner.invoke(app, ["spec", "validate", "--spec-dir", "spec"])
     assert result.exit_code == 0
@@ -31,16 +47,13 @@ def test_validate_command_succeeds_for_checked_in_template() -> None:
 
 
 def test_validate_command_returns_non_zero_for_invalid_bundle(tmp_path: Path) -> None:
-    working_dir = tmp_path / "spec"
-    working_dir.mkdir()
-    for name in ("robot.yaml", "task.yaml", "capture.yaml"):
-        (working_dir / name).write_text((Path("spec") / name).read_text(encoding="utf-8"), encoding="utf-8")
-
-    task_data = yaml.safe_load((working_dir / "task.yaml").read_text(encoding="utf-8"))
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    task_path = bundle_root / "spec" / "task.yaml"
+    task_data = _load_yaml(task_path)
     task_data["robot_id"] = "wrong_robot"
-    (working_dir / "task.yaml").write_text(yaml.safe_dump(task_data, sort_keys=False), encoding="utf-8")
+    _write_yaml(task_path, task_data)
 
-    result = runner.invoke(app, ["spec", "validate", "--spec-dir", str(working_dir)])
+    result = runner.invoke(app, ["spec", "validate", "--spec-dir", str(bundle_root / "spec")])
     assert result.exit_code == 1
     assert "task.robot_id 'wrong_robot' must match robot.robot_id" in result.stdout
 
@@ -50,21 +63,20 @@ def test_schema_command_emits_schemas_that_accept_the_example_bundle(tmp_path: P
     result = runner.invoke(app, ["spec", "schema", "--out-dir", str(out_dir)])
     assert result.exit_code == 0
 
-    robot_schema = json.loads((out_dir / "robot.schema.json").read_text(encoding="utf-8"))
-    task_schema = json.loads((out_dir / "task.schema.json").read_text(encoding="utf-8"))
-    capture_schema = json.loads((out_dir / "capture.schema.json").read_text(encoding="utf-8"))
+    for schema_name, data_name in (
+        ("project.schema.json", "project.yaml"),
+        ("robot.schema.json", "robot.yaml"),
+        ("task.schema.json", "task.yaml"),
+        ("capture.schema.json", "capture.yaml"),
+        ("ontology.schema.json", "ontology.yaml"),
+    ):
+        schema = json.loads((out_dir / schema_name).read_text(encoding="utf-8"))
+        instance = yaml.safe_load((Path("spec") / data_name).read_text(encoding="utf-8"))
+        jsonschema_validate(instance=instance, schema=schema)
 
-    robot_data = yaml.safe_load(Path("spec/robot.yaml").read_text(encoding="utf-8"))
-    task_data = yaml.safe_load(Path("spec/task.yaml").read_text(encoding="utf-8"))
-    capture_data = yaml.safe_load(Path("spec/capture.yaml").read_text(encoding="utf-8"))
 
-    jsonschema_validate(instance=robot_data, schema=robot_schema)
-    jsonschema_validate(instance=task_data, schema=task_schema)
-    jsonschema_validate(instance=capture_data, schema=capture_schema)
-
-
-def test_init_command_materializes_template(tmp_path: Path) -> None:
-    out_dir = tmp_path / "new-spec"
+def test_init_command_materializes_full_template_bundle(tmp_path: Path) -> None:
+    out_dir = tmp_path / "new-bundle"
     result = runner.invoke(
         app,
         [
@@ -77,20 +89,24 @@ def test_init_command_materializes_template(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0
-    assert (out_dir / "robot.yaml").exists()
-    assert (out_dir / "task.yaml").exists()
-    assert (out_dir / "capture.yaml").exists()
+    assert (out_dir / "spec" / "project.yaml").exists()
+    assert (out_dir / "spec" / "robot.yaml").exists()
+    assert (out_dir / "spec" / "task.yaml").exists()
+    assert (out_dir / "spec" / "capture.yaml").exists()
+    assert (out_dir / "spec" / "ontology.yaml").exists()
+    assert (out_dir / "spec" / "coordinate_frames.md").exists()
+    assert (out_dir / "env" / "sfm.environment.yml").exists()
+    assert (out_dir / "checklists" / "readiness.md").exists()
 
 
-def _write_beta_friendly_spec_bundle(target_dir: Path) -> Path:
-    target_dir.mkdir(parents=True, exist_ok=True)
-    for name in ("robot.yaml", "task.yaml", "capture.yaml"):
-        (target_dir / name).write_text(Path("spec", name).read_text(encoding="utf-8"), encoding="utf-8")
-
-    capture_data = yaml.safe_load((target_dir / "capture.yaml").read_text(encoding="utf-8"))
-    capture_data["beta"]["colmap"]["min_registered_keyframes"] = 3
-    (target_dir / "capture.yaml").write_text(yaml.safe_dump(capture_data, sort_keys=False), encoding="utf-8")
-    return target_dir
+def _write_beta_friendly_bundle_root(target_root: Path) -> Path:
+    bundle_root = _copy_bundle_root(target_root)
+    project_path = bundle_root / "spec" / "project.yaml"
+    project_data = _load_yaml(project_path)
+    project_data["acceptance"]["beta_min_registered_keyframes"] = 3
+    project_data["acceptance"]["beta_min_registered_fraction"] = 0.5
+    _write_yaml(project_path, project_data)
+    return bundle_root
 
 
 def _build_fake_model() -> ParsedColmapModel:
@@ -102,12 +118,11 @@ def _build_fake_model() -> ParsedColmapModel:
         height_px=8,
         params=[8.0, 8.0, 4.0, 4.0, 0.0, 0.0, 0.0, 0.0],
     )
-    image_names = ("frame_000000.png", "frame_000002.png", "frame_000004.png")
-    camera_centers = (
-        np.array([0.0, 0.0, 1.0], dtype=float),
-        np.array([1.0, 0.0, 1.0], dtype=float),
-        np.array([1.0, 1.0, 1.0], dtype=float),
-    )
+    image_centers = {
+        "frame_000000.png": np.array([0.0, 0.0, 1.0], dtype=float),
+        "frame_000001.png": np.array([1.0, 0.0, 1.0], dtype=float),
+        "frame_000002.png": np.array([1.0, 1.0, 1.0], dtype=float),
+    }
     images = {
         name: ColmapImage(
             image_id=index + 1,
@@ -117,10 +132,10 @@ def _build_fake_model() -> ParsedColmapModel:
             name=name,
             observations=[],
         )
-        for index, (name, center) in enumerate(zip(image_names, camera_centers))
+        for index, (name, center) in enumerate(image_centers.items())
     }
     return ParsedColmapModel(
-        model_name="0",
+        model_name="final",
         text_dir=Path("."),
         cameras={1: camera},
         images_by_name=images,
@@ -136,44 +151,52 @@ def _patch_successful_beta_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
 
     def fake_decode(video_path: Path, frames_dir: Path, image_format: str):
         decoded_frames = [
-            DecodedFrame(index=index, timestamp_sec=index * 0.25, rgb=np.full((8, 8, 3), index * 30, dtype=np.uint8))
+            DecodedFrame(index=index, pts=index * 30, pts_sec=float(index) * 5.0, t_ns=index * 5_000_000_000, rgb=np.full((8, 8, 3), index * 30, dtype=np.uint8))
             for index in range(5)
         ]
         records = extract_frames_from_source(decoded_frames, frames_dir=frames_dir, image_format=image_format)
         metadata = {
             "width_px": 8,
             "height_px": 8,
-            "nominal_fps": 4.0,
+            "nominal_fps": 30.0,
             "frame_count": len(records),
             "timestamp_source": "synthetic",
+            "duration_sec": records[-1].pts_sec,
         }
         return records, metadata
 
-    def fake_run_colmap(colmap_bin: str, keyframes_dir: Path, work_dir: Path, capture):
-        work_dir.mkdir(parents=True, exist_ok=True)
-        (work_dir / "raw_artifact.txt").write_text("colmap", encoding="utf-8")
-        return _build_fake_model()
+    def fake_run_colmap(colmap_bin: str, frames_dir: Path, records, colmap_root: Path, capture):
+        database_path = colmap_root / "database.db"
+        sparse_root = colmap_root / "sparse"
+        sparse_text_root = colmap_root / "sparse_txt"
+        staging_dir = colmap_root / "_staging"
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        sparse_root.mkdir(parents=True, exist_ok=True)
+        sparse_text_root.mkdir(parents=True, exist_ok=True)
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        (database_path).write_text("db", encoding="utf-8")
+        (sparse_root / "base").mkdir(parents=True, exist_ok=True)
+        (sparse_root / "final").mkdir(parents=True, exist_ok=True)
+        (sparse_text_root / "base").mkdir(parents=True, exist_ok=True)
+        (sparse_text_root / "final").mkdir(parents=True, exist_ok=True)
+        (staging_dir / "debug.txt").write_text("staging", encoding="utf-8")
+        model = _build_fake_model()
+        return ColmapPipelineResult(
+            base_model=model,
+            final_model=model,
+            database_path=database_path,
+            sparse_root=sparse_root,
+            sparse_text_root=sparse_text_root,
+            component_count=1,
+            staging_dir=staging_dir,
+        )
 
-    def fake_detect_fiducials(capture, model, keyframe_map):
+    def fake_detect_fiducials(capture, model, record_map):
+        rotation = np.eye(3, dtype=float)
         return [
-            FiducialDetection(
-                frame_name="frame_000000.png",
-                marker_id=1,
-                rotation_tc=np.eye(3, dtype=float),
-                translation_tc=np.array([1.0, 1.0, 0.0], dtype=float),
-            ),
-            FiducialDetection(
-                frame_name="frame_000002.png",
-                marker_id=1,
-                rotation_tc=np.eye(3, dtype=float),
-                translation_tc=np.array([3.0, 1.0, 0.0], dtype=float),
-            ),
-            FiducialDetection(
-                frame_name="frame_000004.png",
-                marker_id=1,
-                rotation_tc=np.eye(3, dtype=float),
-                translation_tc=np.array([3.0, 3.0, 0.0], dtype=float),
-            ),
+            FiducialDetection("frame_000000.png", 1, rotation, np.array([1.0, 1.0, 0.0], dtype=float)),
+            FiducialDetection("frame_000001.png", 1, rotation, np.array([3.0, 1.0, 0.0], dtype=float)),
+            FiducialDetection("frame_000002.png", 1, rotation, np.array([3.0, 3.0, 0.0], dtype=float)),
         ]
 
     monkeypatch.setattr(video_ingest, "ensure_beta_dependencies", fake_dependencies)
@@ -188,23 +211,23 @@ def _patch_successful_beta_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_video_ingest_missing_colmap_hard_fails(tmp_path: Path) -> None:
-    spec_dir = _write_beta_friendly_spec_bundle(tmp_path / "spec")
+    bundle_root = _write_beta_friendly_bundle_root(tmp_path / "bundle")
     video_path = tmp_path / "demo.mp4"
     video_path.write_bytes(b"not-a-real-video")
 
     result = runner.invoke(
         app,
-        ["video", "ingest-monocular", "--spec-dir", str(spec_dir), "--video", str(video_path), "--out-dir", str(tmp_path / "out")],
+        ["video", "ingest-monocular", "--spec-dir", str(bundle_root / "spec"), "--video", str(video_path), "--out-dir", str(tmp_path / "out")],
     )
 
     assert result.exit_code == 1
     assert "COLMAP binary not found" in result.stdout
 
 
-def test_video_ingest_success_writes_outputs_and_prunes_workdir(
+def test_video_ingest_success_writes_canonical_outputs_and_prunes_only_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    spec_dir = _write_beta_friendly_spec_bundle(tmp_path / "spec")
+    bundle_root = _write_beta_friendly_bundle_root(tmp_path / "bundle")
     video_path = tmp_path / "demo.mp4"
     out_dir = tmp_path / "out"
     video_path.write_bytes(b"synthetic")
@@ -212,23 +235,30 @@ def test_video_ingest_success_writes_outputs_and_prunes_workdir(
 
     result = runner.invoke(
         app,
-        ["video", "ingest-monocular", "--spec-dir", str(spec_dir), "--video", str(video_path), "--out-dir", str(out_dir)],
+        ["video", "ingest-monocular", "--spec-dir", str(bundle_root / "spec"), "--video", str(video_path), "--out-dir", str(out_dir)],
     )
 
     assert result.exit_code == 0
-    assert (out_dir / "frames").exists()
+    assert (out_dir / "frames" / "index.csv").exists()
+    assert (out_dir / "calibration" / "intrinsics_opencv.yaml").exists()
+    assert (out_dir / "colmap" / "database.db").exists()
+    assert (out_dir / "colmap" / "sparse" / "final").exists()
+    assert (out_dir / "colmap" / "sparse_txt" / "final").exists()
+    assert (out_dir / "camera" / "intrinsics.json").exists()
+    assert (out_dir / "camera" / "camera_poses.json").exists()
+    assert (out_dir / "scene" / "sparse_points.ply").exists()
     assert (out_dir / "timestamps.csv").exists()
     assert (out_dir / "camera_intrinsics.json").exists()
     assert (out_dir / "camera_poses.json").exists()
     assert (out_dir / "reprojection_preview.jpg").exists()
     assert (out_dir / "reconstruction_summary.json").exists()
-    assert not (out_dir / "_workdir").exists()
+    assert not (out_dir / "colmap" / "_staging").exists()
 
 
-def test_video_ingest_keep_workdir_preserves_raw_artifacts(
+def test_video_ingest_keep_workdir_preserves_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    spec_dir = _write_beta_friendly_spec_bundle(tmp_path / "spec")
+    bundle_root = _write_beta_friendly_bundle_root(tmp_path / "bundle")
     video_path = tmp_path / "demo.mp4"
     out_dir = tmp_path / "out"
     video_path.write_bytes(b"synthetic")
@@ -240,7 +270,7 @@ def test_video_ingest_keep_workdir_preserves_raw_artifacts(
             "video",
             "ingest-monocular",
             "--spec-dir",
-            str(spec_dir),
+            str(bundle_root / "spec"),
             "--video",
             str(video_path),
             "--out-dir",
@@ -250,5 +280,5 @@ def test_video_ingest_keep_workdir_preserves_raw_artifacts(
     )
 
     assert result.exit_code == 0
-    assert (out_dir / "_workdir").exists()
-    assert (out_dir / "_workdir" / "raw_artifact.txt").exists()
+    assert (out_dir / "colmap" / "_staging").exists()
+    assert (out_dir / "colmap" / "_staging" / "debug.txt").exists()

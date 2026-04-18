@@ -4,6 +4,7 @@ robot_id: ur5e_robotiq_2f85
 family: pick_place
 language_prompt: Pick up the red cube and place it into the black tray.
 pick_object:
+  ontology_id: target_object
   text_prompt: red cube
   search_region_m:
     min_m:
@@ -15,6 +16,7 @@ pick_object:
       y: 0.12
       z: 0.22
 place_region:
+  ontology_id: receptacle
   text_prompt: black tray center
   target_region_m:
     min_m:
@@ -35,4 +37,3 @@ operator_assist:
   allow_prompt_edit: true
 assistant:
   provider: gemini
-
