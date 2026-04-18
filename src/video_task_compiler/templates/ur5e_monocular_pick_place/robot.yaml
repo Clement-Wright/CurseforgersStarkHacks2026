@@ -1,0 +1,42 @@
+api_version: video-task-compiler/v1alpha1
+robot_id: ur5e_robotiq_2f85
+model_ref: mujoco_menagerie/universal_robots_ur5e/ur5e_robotiq_2f85.xml
+base_frame: base_link
+ee_frame: tool0
+gripper:
+  type: parallel_jaw
+  model: robotiq_2f85
+  open_width_m: 0.085
+  closed_width_m: 0.0
+home_joint_positions_rad:
+  - 0.0
+  - -1.5708
+  - 1.5708
+  - -1.5708
+  - -1.5708
+  - 0.0
+workspace_bounds_m:
+  min_m:
+    x: 0.25
+    y: -0.45
+    z: 0.02
+  max_m:
+    x: 0.85
+    y: 0.45
+    z: 0.55
+action_space:
+  arm_dof: 6
+  gripper_dof: 1
+  control_mode: cartesian_delta_pose_plus_gripper
+  arm_joint_order:
+    - shoulder_pan_joint
+    - shoulder_lift_joint
+    - elbow_joint
+    - wrist_1_joint
+    - wrist_2_joint
+    - wrist_3_joint
+  gripper_width_range_m:
+    min: 0.0
+    max: 0.085
+control_rate_hz: 20
+

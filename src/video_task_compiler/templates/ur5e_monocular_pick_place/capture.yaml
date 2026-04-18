@@ -1,0 +1,28 @@
+api_version: video-task-compiler/v1alpha1
+capture_id: monocular_tabletop_orbit
+modality: rgb_monocular
+camera_device:
+  class_name: handheld_phone
+  intrinsics_mode: colmap_estimated
+resolution:
+  width: 1920
+  height: 1080
+fps: 30
+motion_protocol:
+  capture_mode: handheld_orbit
+  fixed_zoom: true
+  min_orbit_degrees: 120
+  start_with_full_table_view: true
+  avoid_scene_cuts: true
+scale_source: fiducial
+fiducial:
+  family: apriltag36h11
+  size_m: 0.06
+  visible_at_start: true
+  visible_at_end: true
+constraints:
+  scene_mostly_static: true
+  single_demonstrator: true
+  object_visibility_ratio_min: 0.6
+  lock_exposure_if_possible: true
+
