@@ -29,6 +29,7 @@ def test_checked_in_bundle_validates() -> None:
 
     assert bundle.project.capture.preroll_seconds == pytest.approx(10.0)
     assert bundle.project.gamma.primary_backbone == "fourdhumans"
+    assert bundle.project.delta.primary_backbone == "grounded_sam2"
     assert bundle.task.pick_object.ontology_id == "target_object"
     assert bundle.capture.beta.normalization.world_frame == "fiducial_center"
     assert bundle.env_specs["sfm"].name == "video-task-compiler-sfm"
@@ -113,6 +114,19 @@ def test_missing_gamma_block_reports_targeted_error(tmp_path: Path) -> None:
     assert any(issue.field_path == "gamma" for issue in excinfo.value.issues)
 
 
+def test_missing_delta_block_reports_targeted_error(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    project_path = bundle_root / "spec" / "project.yaml"
+    project_data = _load_yaml(project_path)
+    del project_data["delta"]
+    _write_yaml(project_path, project_data)
+
+    with pytest.raises(SpecValidationError) as excinfo:
+        load_bundle(bundle_root / "spec")
+
+    assert any(issue.field_path == "delta" for issue in excinfo.value.issues)
+
+
 def test_invalid_gamma_acceptance_threshold_is_rejected(tmp_path: Path) -> None:
     bundle_root = _copy_bundle_root(tmp_path / "bundle")
     project_path = bundle_root / "spec" / "project.yaml"
@@ -124,6 +138,19 @@ def test_invalid_gamma_acceptance_threshold_is_rejected(tmp_path: Path) -> None:
         load_bundle(bundle_root / "spec")
 
     assert any(issue.field_path == "acceptance.gamma_min_median_wrist_confidence" for issue in excinfo.value.issues)
+
+
+def test_invalid_delta_acceptance_threshold_is_rejected(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    project_path = bundle_root / "spec" / "project.yaml"
+    project_data = _load_yaml(project_path)
+    project_data["acceptance"]["delta_max_duplicate_ids_in_review_sample"] = -1
+    _write_yaml(project_path, project_data)
+
+    with pytest.raises(SpecValidationError) as excinfo:
+        load_bundle(bundle_root / "spec")
+
+    assert any(issue.field_path == "acceptance.delta_max_duplicate_ids_in_review_sample" for issue in excinfo.value.issues)
 
 
 def test_task_regions_must_stay_inside_workspace(tmp_path: Path) -> None:

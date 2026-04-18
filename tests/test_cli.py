@@ -14,7 +14,7 @@ from jsonschema import validate as jsonschema_validate
 from typer.testing import CliRunner
 
 from video_task_compiler.cli import app
-from video_task_compiler.human_extract import GammaIntrinsics
+from video_task_compiler.human_extract import GammaIntrinsics, discover_native_track_file
 from video_task_compiler.video_ingest import (
     ColmapCamera,
     ColmapImage,
@@ -444,7 +444,17 @@ def _patch_successful_gamma_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(human_extract, "run_fourdhumans_tracking", fake_run_fourdhumans_tracking)
 
 
-def test_video_ingest_missing_colmap_hard_fails(tmp_path: Path) -> None:
+def test_video_ingest_missing_colmap_hard_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from video_task_compiler import video_ingest
+
+    monkeypatch.setattr(
+        video_ingest,
+        "ensure_beta_dependencies",
+        lambda colmap_bin=None: (_ for _ in ()).throw(video_ingest.DependencyError("COLMAP binary not found on PATH. Install COLMAP or pass --colmap-bin.")),
+    )
     bundle_root = _write_beta_friendly_bundle_root(tmp_path / "bundle")
     video_path = tmp_path / "demo.mp4"
     video_path.write_bytes(b"not-a-real-video")
@@ -602,3 +612,21 @@ def test_human_extract_success_writes_gamma_outputs(
     assert table.num_rows == 4
     summary = json.loads((out_dir / "human" / "summary.json").read_text(encoding="utf-8"))
     assert summary["primary_track_id"] == 7
+
+
+def test_discover_native_track_file_falls_back_to_upstream_results_dir(tmp_path: Path) -> None:
+    work_dir = tmp_path / "workdir"
+    results_dir = tmp_path / "4D-Humans" / "outputs" / "results"
+    outputs_dir = tmp_path / "4D-Humans" / "outputs"
+    data_dir = tmp_path / "4D-Humans" / "data"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    (data_dir / "basicModel_neutral_lbs_10_207_0_v1.0.0.pkl").write_bytes(b"model")
+    expected_path = results_dir / "demo_frames.pkl"
+    expected_path.write_bytes(b"tracks")
+
+    discovered_path = discover_native_track_file(work_dir, results_dir, outputs_dir)
+
+    assert discovered_path == expected_path.resolve()

@@ -12,6 +12,7 @@ import pytest
 from video_task_compiler.video_ingest import (
     ColmapCamera,
     ColmapImage,
+    ColmapPipelineResult,
     DecodedFrame,
     FiducialDetection,
     FrameRecord,
@@ -24,11 +25,15 @@ from video_task_compiler.video_ingest import (
     parse_images_txt,
     parse_points3d_txt,
     relative_timestamp_ns,
+    run_colmap_pipeline,
+    colmap_subprocess_env,
+    should_use_colmap_gpu,
     select_keyframe_indices,
     timestamp_seconds_from_pts,
     assign_frame_segments,
     build_pose_timeline,
 )
+from video_task_compiler.specs import load_bundle, validate_bundle
 
 
 def test_extract_frames_from_source_writes_dense_frames(tmp_path: Path) -> None:
@@ -228,6 +233,270 @@ def test_compute_reprojection_statistics_returns_finite_error() -> None:
 
     assert stats.observation_count == 1
     assert stats.mean_error_px == pytest.approx(0.0)
+
+
+def test_should_use_colmap_gpu_respects_explicit_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    assert should_use_colmap_gpu("always") is True
+    assert should_use_colmap_gpu("never") is False
+
+
+def test_should_use_colmap_gpu_auto_detects_available_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None)
+    assert should_use_colmap_gpu("auto") is True
+
+
+def test_should_use_colmap_gpu_auto_honors_disabled_cuda_devices(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None)
+    assert should_use_colmap_gpu("auto") is False
+
+
+def test_colmap_subprocess_env_clears_opencv_qt_plugin_variables(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM_PLUGIN_PATH", "/tmp/cv2/plugins")
+    monkeypatch.setenv("QT_PLUGIN_PATH", "/tmp/cv2")
+    monkeypatch.setenv("QT_QPA_FONTDIR", "/tmp/cv2/fonts")
+
+    env = colmap_subprocess_env()
+
+    assert "QT_QPA_PLATFORM_PLUGIN_PATH" not in env
+    assert "QT_PLUGIN_PATH" not in env
+    assert "QT_QPA_FONTDIR" not in env
+    assert env["QT_QPA_PLATFORM"] == "offscreen"
+
+
+def test_run_colmap_pipeline_creates_mapper_output_dir_before_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    preroll_image = frames_dir / "frame_000000.png"
+    demo_image = frames_dir / "frame_000001.png"
+    preroll_image.write_bytes(b"png")
+    demo_image.write_bytes(b"png")
+    records = [
+        FrameRecord(
+            0,
+            "frame_000000.png",
+            0,
+            0.0,
+            0,
+            preroll_image,
+            segment="preroll",
+            is_keyframe=True,
+        ),
+        FrameRecord(
+            1,
+            "frame_000001.png",
+            1,
+            1.0,
+            1_000_000_000,
+            demo_image,
+            segment="demo",
+        ),
+    ]
+    bundle = validate_bundle(load_bundle(Path("spec")))
+    colmap_root = tmp_path / "colmap"
+    fake_text_dir = tmp_path / "fake_text"
+    fake_sparse_dir = tmp_path / "fake_sparse"
+    fake_text_dir.mkdir()
+    fake_sparse_dir.mkdir()
+    fake_model = ParsedColmapModel(
+        model_name="0",
+        text_dir=fake_text_dir,
+        cameras={},
+        images_by_name={},
+        points3d={},
+    )
+
+    def fake_run_command(
+        command: list[str],
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        if command[1] == "mapper":
+            output_path = Path(command[command.index("--output_path") + 1])
+            assert output_path.exists()
+            assert output_path.is_dir()
+        if command[1] in {"mapper", "image_registrator"}:
+            output_path = Path(command[command.index("--output_path") + 1])
+            output_path.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr("video_task_compiler.video_ingest.run_command", fake_run_command)
+    monkeypatch.setattr(
+        "video_task_compiler.video_ingest.choose_largest_sparse_component",
+        lambda **_: (fake_model, fake_sparse_dir, 1),
+    )
+    monkeypatch.setattr("video_task_compiler.video_ingest.load_text_model", lambda *args, **kwargs: fake_model)
+    monkeypatch.setattr("video_task_compiler.video_ingest.convert_model_to_text", lambda *args, **kwargs: fake_model)
+
+    result = run_colmap_pipeline(
+        colmap_bin="colmap",
+        frames_dir=frames_dir,
+        records=records,
+        colmap_root=colmap_root,
+        capture=bundle.capture,
+    )
+
+    assert isinstance(result, ColmapPipelineResult)
+
+
+def test_run_colmap_pipeline_creates_image_registrator_output_dir_before_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    preroll_image = frames_dir / "frame_000000.png"
+    demo_image = frames_dir / "frame_000001.png"
+    preroll_image.write_bytes(b"png")
+    demo_image.write_bytes(b"png")
+    records = [
+        FrameRecord(
+            0,
+            "frame_000000.png",
+            0,
+            0.0,
+            0,
+            preroll_image,
+            segment="preroll",
+            is_keyframe=True,
+        ),
+        FrameRecord(
+            1,
+            "frame_000001.png",
+            1,
+            1.0,
+            1_000_000_000,
+            demo_image,
+            segment="demo",
+        ),
+    ]
+    bundle = validate_bundle(load_bundle(Path("spec")))
+    colmap_root = tmp_path / "colmap"
+    fake_text_dir = tmp_path / "fake_text"
+    fake_sparse_dir = tmp_path / "fake_sparse"
+    fake_text_dir.mkdir()
+    fake_sparse_dir.mkdir()
+    fake_model = ParsedColmapModel(
+        model_name="0",
+        text_dir=fake_text_dir,
+        cameras={},
+        images_by_name={},
+        points3d={},
+    )
+
+    def fake_run_command(
+        command: list[str],
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        if command[1] == "image_registrator":
+            assert "--image_path" not in command
+            output_path = Path(command[command.index("--output_path") + 1])
+            assert output_path.exists()
+            assert output_path.is_dir()
+
+    monkeypatch.setattr("video_task_compiler.video_ingest.run_command", fake_run_command)
+    monkeypatch.setattr(
+        "video_task_compiler.video_ingest.choose_largest_sparse_component",
+        lambda **_: (fake_model, fake_sparse_dir, 1),
+    )
+    monkeypatch.setattr("video_task_compiler.video_ingest.load_text_model", lambda *args, **kwargs: fake_model)
+    monkeypatch.setattr("video_task_compiler.video_ingest.convert_model_to_text", lambda *args, **kwargs: fake_model)
+
+    result = run_colmap_pipeline(
+        colmap_bin="colmap",
+        frames_dir=frames_dir,
+        records=records,
+        colmap_root=colmap_root,
+        capture=bundle.capture,
+    )
+
+    assert isinstance(result, ColmapPipelineResult)
+
+
+def test_run_colmap_pipeline_extracts_preroll_before_localization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    preroll_image = frames_dir / "frame_000000.png"
+    demo_image = frames_dir / "frame_000001.png"
+    preroll_image.write_bytes(b"png")
+    demo_image.write_bytes(b"png")
+    records = [
+        FrameRecord(
+            0,
+            "frame_000000.png",
+            0,
+            0.0,
+            0,
+            preroll_image,
+            segment="preroll",
+            is_keyframe=True,
+        ),
+        FrameRecord(
+            1,
+            "frame_000001.png",
+            1,
+            1.0,
+            1_000_000_000,
+            demo_image,
+            segment="demo",
+        ),
+    ]
+    bundle = validate_bundle(load_bundle(Path("spec")))
+    colmap_root = tmp_path / "colmap"
+    fake_text_dir = tmp_path / "fake_text"
+    fake_sparse_dir = tmp_path / "fake_sparse"
+    fake_text_dir.mkdir()
+    fake_sparse_dir.mkdir()
+    fake_model = ParsedColmapModel(
+        model_name="0",
+        text_dir=fake_text_dir,
+        cameras={},
+        images_by_name={},
+        points3d={},
+    )
+    commands: list[list[str]] = []
+
+    def fake_run_command(
+        command: list[str],
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        commands.append(command)
+        if command[1] in {"mapper", "image_registrator"}:
+            output_path = Path(command[command.index("--output_path") + 1])
+            output_path.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr("video_task_compiler.video_ingest.run_command", fake_run_command)
+    monkeypatch.setattr(
+        "video_task_compiler.video_ingest.choose_largest_sparse_component",
+        lambda **_: (fake_model, fake_sparse_dir, 1),
+    )
+    monkeypatch.setattr("video_task_compiler.video_ingest.load_text_model", lambda *args, **kwargs: fake_model)
+    monkeypatch.setattr("video_task_compiler.video_ingest.convert_model_to_text", lambda *args, **kwargs: fake_model)
+
+    run_colmap_pipeline(
+        colmap_bin="colmap",
+        frames_dir=frames_dir,
+        records=records,
+        colmap_root=colmap_root,
+        capture=bundle.capture,
+    )
+
+    feature_extractor_commands = [command for command in commands if command[1] == "feature_extractor"]
+    assert len(feature_extractor_commands) == 2
+
+    preroll_list = Path(feature_extractor_commands[0][feature_extractor_commands[0].index("--image_list_path") + 1])
+    localization_list = Path(feature_extractor_commands[1][feature_extractor_commands[1].index("--image_list_path") + 1])
+    assert preroll_list.read_text(encoding="utf-8").strip() == "frame_000000.png"
+    assert localization_list.read_text(encoding="utf-8").strip() == "frame_000001.png"
 
 
 @pytest.mark.skipif(

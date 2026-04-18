@@ -6,9 +6,12 @@ import json
 import math
 import os
 import pickle
+import re
 import shutil
 import subprocess
+import zlib
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -160,17 +163,52 @@ def run_command(command: list[str], cwd: Path | None = None, env: dict[str, str]
         raise HumanExtractError(f"command failed: {' '.join(command)} :: {detail}")
 
 
-def discover_native_track_file(search_root: Path) -> Path:
-    candidates = sorted(path for path in search_root.rglob("*.pkl") if path.is_file())
+def discover_native_track_file(*search_roots: Path) -> Path:
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for search_root in search_roots:
+        if not search_root.exists() or not search_root.is_dir():
+            continue
+        for candidate in search_root.rglob("*.pkl"):
+            if candidate.is_file():
+                resolved = candidate.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    candidates.append(resolved)
     if not candidates:
         raise HumanExtractError("4DHumans did not produce any .pkl track artifact")
 
-    def candidate_rank(path: Path) -> tuple[int, str]:
+    def candidate_rank(path: Path) -> tuple[int, int, float, str]:
         name = path.name.lower()
-        preferred = 0 if ("track" in name or "phalp" in name) else 1
-        return (preferred, name)
+        parent = path.parent.as_posix().lower()
+        if "basicmodel" in name or "/data/" in parent:
+            preferred = 3
+        elif "track" in name or "phalp" in name:
+            preferred = 0
+        elif "result" in parent or "demo_frames" in name:
+            preferred = 1
+        else:
+            preferred = 2
+        return (preferred, len(path.parts), -path.stat().st_mtime, name)
 
     return sorted(candidates, key=candidate_rank)[0]
+
+
+def stage_fourdhumans_source_frames(
+    frame_records: Sequence[GammaFrameRecord],
+    staging_dir: Path,
+) -> Path:
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir, ignore_errors=True)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    for frame_record in sorted(frame_records, key=lambda item: item.frame_idx):
+        staged_name = f"{Path(frame_record.frame_name).stem}.jpg"
+        staged_path = staging_dir / staged_name
+        with Image.open(frame_record.image_path) as image:
+            image.convert("RGB").save(staged_path, format="JPEG", quality=95)
+
+    return staging_dir
 
 
 def run_fourdhumans_tracking(
@@ -200,7 +238,11 @@ def run_fourdhumans_tracking(
         f"hydra.run.dir={work_dir.as_posix()}",
     ]
     run_command(command, cwd=fourdhumans_root, env=env)
-    return discover_native_track_file(work_dir)
+    return discover_native_track_file(
+        work_dir,
+        fourdhumans_root / "outputs" / "results",
+        fourdhumans_root / "outputs",
+    )
 
 
 def load_frame_index_csv(path: Path) -> list[GammaFrameRecord]:
@@ -271,11 +313,172 @@ def load_camera_intrinsics(path: Path) -> GammaIntrinsics | None:
 
 
 def load_native_track_payload(path: Path) -> Any:
-    with path.open("rb") as handle:
-        return pickle.load(handle)
+    payload_bytes = path.read_bytes()
+    candidate_buffers = [payload_bytes]
+    try:
+        candidate_buffers.append(zlib.decompress(payload_bytes))
+    except Exception:
+        pass
+
+    for candidate in candidate_buffers:
+        try:
+            return pickle.loads(candidate)
+        except Exception:
+            pass
+        try:
+            import joblib
+
+            return joblib.load(BytesIO(candidate))
+        except Exception:
+            pass
+
+    raise HumanExtractError(f"could not deserialize native 4DHumans track payload: {path}")
+
+
+def _looks_like_frame_indexed_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict) or not payload:
+        return False
+    first_value = next(iter(payload.values()))
+    if not isinstance(first_value, dict):
+        return False
+    return "tid" in first_value and "bbox" in first_value
+
+
+def _frame_idx_from_native_value(frame_key: Any, frame_payload: dict[str, Any]) -> int | None:
+    for candidate in (frame_payload.get("frame_idx"), frame_payload.get("frame_index"), frame_payload.get("time")):
+        if isinstance(candidate, (int, np.integer)):
+            return int(candidate)
+    for candidate in (
+        frame_payload.get("img_name"),
+        frame_payload.get("frame_path"),
+        frame_payload.get("img_path"),
+        frame_key,
+    ):
+        if not isinstance(candidate, str):
+            continue
+        match = re.search(r"(\d+)(?=\.[^.]+$|$)", Path(candidate).name)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _native_list_item(payload: dict[str, Any], key: str, index: int) -> Any:
+    value = payload.get(key)
+    if not isinstance(value, list):
+        return value
+    if key == "size" and value and all(isinstance(item, (int, float, np.integer, np.floating)) for item in value[:2]):
+        return value
+    if index >= len(value):
+        return None
+    return value[index]
+
+
+def _native_joints2d_to_xyc(
+    joints_payload: Any,
+    image_size: Sequence[int] | None,
+    confidence: float,
+) -> np.ndarray:
+    joints = np.asarray(joints_payload, dtype=np.float32)
+    if joints.size == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    if joints.ndim == 1:
+        if joints.size % 2 == 0:
+            joints = joints.reshape(-1, 2)
+        elif joints.size % 3 == 0:
+            joints = joints.reshape(-1, 3)
+        else:
+            return np.zeros((0, 3), dtype=np.float32)
+
+    if joints.ndim != 2:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    coords = joints[:, :2].astype(np.float32)
+    if coords.size and np.nanmax(coords) <= 2.0 and image_size and len(image_size) >= 2:
+        height_px = float(image_size[0])
+        width_px = float(image_size[1])
+        coords[:, 0] *= width_px
+        coords[:, 1] *= height_px
+
+    if joints.shape[1] >= 3:
+        confidence_column = joints[:, 2:3].astype(np.float32)
+    else:
+        confidence_column = np.full((coords.shape[0], 1), float(confidence), dtype=np.float32)
+    return np.concatenate([coords, confidence_column], axis=1).astype(np.float32)
+
+
+def _frame_indexed_payload_to_tracks(payload: dict[str, Any]) -> Iterable[tuple[int, dict[str, Any]]]:
+    aggregated_tracks: dict[int, dict[str, Any]] = {}
+
+    for frame_key, frame_payload in payload.items():
+        if not isinstance(frame_payload, dict):
+            continue
+        frame_idx = _frame_idx_from_native_value(frame_key, frame_payload)
+        if frame_idx is None:
+            continue
+        track_ids = frame_payload.get("tid")
+        if not isinstance(track_ids, list):
+            continue
+
+        for index, track_id in enumerate(track_ids):
+            track_id_int = int(track_id)
+            detection_score = float(np.asarray(_native_list_item(frame_payload, "conf", index), dtype=np.float32))
+            bbox_xywh = np.asarray(_native_list_item(frame_payload, "bbox", index), dtype=np.float32).reshape(-1)
+            if bbox_xywh.size >= 4:
+                bbox_xyxy = np.array(
+                    [
+                        bbox_xywh[0],
+                        bbox_xywh[1],
+                        bbox_xywh[0] + bbox_xywh[2],
+                        bbox_xywh[1] + bbox_xywh[3],
+                    ],
+                    dtype=np.float32,
+                )
+            else:
+                bbox_xyxy = np.zeros(4, dtype=np.float32)
+
+            image_size = frame_payload.get("size")
+            joints2d_xyc = _native_joints2d_to_xyc(
+                _native_list_item(frame_payload, "2d_joints", index),
+                image_size if isinstance(image_size, list) else None,
+                detection_score,
+            )
+            joints3d_cam = np.asarray(_native_list_item(frame_payload, "3d_joints", index), dtype=np.float32)
+            smpl_payload = _native_list_item(frame_payload, "smpl", index)
+            camera_payload = _native_list_item(frame_payload, "camera", index)
+
+            normalized_frame = {
+                "frame_idx": frame_idx,
+                "bbox_xyxy": bbox_xyxy,
+                "score": detection_score,
+                "joints2d_xyc": joints2d_xyc,
+                "joints3d_cam": joints3d_cam.astype(np.float32),
+            }
+            if isinstance(smpl_payload, dict):
+                normalized_frame["smpl"] = smpl_payload
+            if camera_payload is not None:
+                normalized_frame["camera"] = np.asarray(camera_payload, dtype=np.float32)
+
+            aggregated_track = aggregated_tracks.setdefault(
+                track_id_int,
+                {
+                    "track_id": track_id_int,
+                    "track_score": detection_score,
+                    "frames": [],
+                },
+            )
+            aggregated_track["track_score"] = max(float(aggregated_track["track_score"]), detection_score)
+            aggregated_track["frames"].append(normalized_frame)
+
+    for track_payload in aggregated_tracks.values():
+        track_payload["frames"].sort(key=lambda item: int(item["frame_idx"]))
+        yield int(track_payload["track_id"]), track_payload
 
 
 def _iter_native_tracks(payload: Any) -> Iterable[tuple[int, dict[str, Any]]]:
+    if _looks_like_frame_indexed_payload(payload):
+        yield from _frame_indexed_payload_to_tracks(payload)
+        return
     if isinstance(payload, dict):
         track_container = payload.get("tracks", payload.get("tracklets", payload.get("results", payload)))
         if isinstance(track_container, dict):
@@ -1005,10 +1208,11 @@ def extract_monocular_human_motion(
     work_dir = human_root / "_workdir"
     human_root.mkdir(parents=True, exist_ok=True)
     native_dir.mkdir(parents=True, exist_ok=True)
+    staged_frames_dir = stage_fourdhumans_source_frames(frame_records, work_dir / "_source_frames_jpg")
 
     native_track_path = run_fourdhumans_tracking(
         fourdhumans_root=resolved_fourdhumans_root,
-        frames_dir=frames_dir,
+        frames_dir=staged_frames_dir,
         work_dir=work_dir,
         smpl_model_path=resolved_smpl_model_path,
         device=device,

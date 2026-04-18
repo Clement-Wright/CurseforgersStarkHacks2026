@@ -32,6 +32,8 @@ beta:
   colmap:
     camera_model: OPENCV
     matcher: sequential
+    use_gpu: auto
+    gpu_index: 0
     max_interpolation_gap_s: 1.0
   normalization:
     world_frame: fiducial_center

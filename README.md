@@ -15,7 +15,9 @@ reconstruction, localizes later frames against that frozen model, normalizes the
 result into a fiducial-aligned metric world frame, and preserves canonical
 COLMAP artifacts by default. Gamma runs 4DHumans over beta’s extracted frames,
 selects one primary demonstrator track, preserves the native tracklets, and
-exports a flat arm-observables layer for downstream robotics code.
+exports a flat arm-observables layer for downstream robotics code. Delta adds a
+local Grounded-SAM-2 object layer that produces stable ontology-scoped masks,
+tracks, interaction candidates, and review overlays.
 
 ## What is included
 
@@ -23,9 +25,10 @@ exports a flat arm-observables layer for downstream robotics code.
 - A `vtc` CLI with `spec init`, `spec validate`, and `spec schema`
 - A `vtc video ingest-monocular` beta pipeline command
 - A `vtc human extract-monocular` gamma pipeline command
+- A `vtc objects extract-monocular` delta pipeline command
 - Typed spec models with cross-file compatibility validation
 - A checked-in example bundle in `spec/`, `env/`, and `checklists/`
-- Tests covering the supported contract, validation rules, beta, and gamma logic
+- Tests covering the supported contract, validation rules, beta, gamma, and delta logic
 
 ## Quick start
 
@@ -36,6 +39,7 @@ vtc spec schema --out-dir build/schemas
 vtc spec init --template ur5e_monocular_pick_place --output-dir ./example-bundle
 vtc video ingest-monocular --spec-dir spec --video ./demo.mp4 --out-dir ./artifacts/run01
 vtc human extract-monocular --spec-dir spec --beta-dir ./artifacts/run01 --out-dir ./artifacts/run01 --fourdhumans-root /path/to/4DHumans --smpl-model /path/to/SMPL_NEUTRAL.pkl
+vtc objects extract-monocular --spec-dir spec --beta-dir ./artifacts/run01 --out-dir ./artifacts/run01 --grounded-sam2-root /path/to/Grounded-SAM-2
 ```
 
 ## Alpha contract
@@ -59,6 +63,7 @@ in profile requires:
 
 - `project.yaml` to own pre-roll, time, acceptance gates, and artifact owners
 - `project.yaml` to own gamma backbone selection, smoothing, and QC thresholds
+- `project.yaml` to own delta backbone selection, interaction thresholds, and mask encoding
 - `task.yaml` to reference ontology IDs instead of relying on free-form naming
 - `coordinate_frames.md` to carry machine-checkable YAML front matter
 - the env files to pin `python=3.10`
@@ -103,9 +108,23 @@ Gamma is 4DHumans-only in the current profile. It always preserves 2D evidence
 plus camera-relative 3D, and it adds world-aligned estimates when beta camera
 poses support them for that frame.
 
+## Delta outputs
+
+The monocular delta pipeline writes:
+
+- `objects/prompts.yaml`
+- `objects/object_tracks.json`
+- `objects/masks_rle.jsonl`
+- `objects/interactions.parquet`
+- `objects/overlays/`
+- `objects/summary.json`
+
+When `--keep-workdir` is used, the raw Grounded-SAM-2 staging area is also
+preserved under `objects/native/`.
+
 ## Out of scope
 
-- Object detection or segmentation
 - MuJoCo MJCF compilation
 - Imitation learning or RL training
 - ROS 2 or hardware deployment
+- DINO-X or Track-Anything rescue flows in the default delta path

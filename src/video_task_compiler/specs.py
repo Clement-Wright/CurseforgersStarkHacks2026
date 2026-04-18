@@ -218,6 +218,8 @@ class ColmapConfigSpec(BaseModel):
 
     camera_model: Literal["OPENCV"]
     matcher: Literal["sequential"]
+    use_gpu: Literal["auto", "always", "never"] = "auto"
+    gpu_index: int = Field(default=0, ge=0)
     max_interpolation_gap_s: float = Field(gt=0.0)
 
 
@@ -292,7 +294,10 @@ class ProjectAcceptanceSpec(BaseModel):
     gamma_min_primary_track_fraction: float = Field(gt=0.0, le=1.0)
     gamma_min_median_wrist_confidence: float = Field(ge=0.0, le=1.0)
     gamma_max_id_switches: int = Field(ge=0)
+    delta_require_all_ontology_entities_tracked: bool
+    delta_max_duplicate_ids_in_review_sample: int = Field(ge=0)
     delta_min_mask_iou_sample: float = Field(gt=0.0, le=1.0)
+    delta_require_rle_decode_success: bool
 
 
 class ProjectGammaSmoothingSpec(BaseModel):
@@ -312,6 +317,24 @@ class ProjectGammaSpec(BaseModel):
     smoothing: ProjectGammaSmoothingSpec
 
 
+class ProjectDeltaInteractionSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    contact_distance_px: float = Field(gt=0.0)
+    wrist_confidence_floor: float = Field(ge=0.0, le=1.0)
+
+
+class ProjectDeltaSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    primary_backbone: Literal["grounded_sam2"]
+    annotation_frame_policy: Literal["best_preroll_then_active"]
+    track_scope: Literal["ontology_only"]
+    overlay_sample_count: int = Field(ge=1)
+    interaction: ProjectDeltaInteractionSpec
+    mask_encoding: Literal["coco_rle"]
+
+
 class ProjectSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -329,6 +352,7 @@ class ProjectSpec(BaseModel):
     world_frame_policy: Literal["fiducial_center"]
     metric_scale_policy: Literal["fiducial_marker"]
     gamma: ProjectGammaSpec
+    delta: ProjectDeltaSpec
     ontology: ProjectOntologyRefsSpec
     sponsor_resources: list[str] = Field(min_length=1)
     acceptance: ProjectAcceptanceSpec
@@ -869,6 +893,42 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
                 bundle.project_path,
                 "gamma.active_segment_policy",
                 "gamma currently defines the active segment as all non-preroll frames",
+            )
+        )
+
+    if bundle.project.delta.primary_backbone != "grounded_sam2":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "delta.primary_backbone",
+                "delta currently supports only the grounded_sam2 primary backbone",
+            )
+        )
+
+    if bundle.project.delta.annotation_frame_policy != "best_preroll_then_active":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "delta.annotation_frame_policy",
+                "delta currently requires best_preroll_then_active seed-frame selection",
+            )
+        )
+
+    if bundle.project.delta.track_scope != "ontology_only":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "delta.track_scope",
+                "delta currently supports only ontology_only tracking scope",
+            )
+        )
+
+    if bundle.project.delta.mask_encoding != "coco_rle":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "delta.mask_encoding",
+                "delta masks must be serialized as coco_rle",
             )
         )
 

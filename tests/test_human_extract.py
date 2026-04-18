@@ -3,11 +3,15 @@ from __future__ import annotations
 import copy
 import importlib.util
 import os
+import pickle
 import subprocess
+import zlib
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
 import pytest
+import joblib
 
 from video_task_compiler.specs import load_bundle, validate_bundle
 from video_task_compiler.human_extract import (
@@ -15,9 +19,11 @@ from video_task_compiler.human_extract import (
     GammaFrameRecord,
     apply_moving_average_smoothing,
     build_arm_observables_rows,
+    load_native_track_payload,
     normalize_fourdhumans_tracks,
     sample_overlay_frame_indices,
     select_primary_demonstrator_track,
+    stage_fourdhumans_source_frames,
 )
 
 
@@ -174,6 +180,84 @@ def test_sample_overlay_frames_uses_active_segment_only(tmp_path: Path) -> None:
     sampled = sample_overlay_frame_indices(frame_records, overlay_count=2)
 
     assert sampled == [1, 3]
+
+
+def test_load_native_track_payload_handles_zlib_compressed_pickles(tmp_path: Path) -> None:
+    payload_path = tmp_path / "demo_frames.pkl"
+    expected_payload = {"tracks": {7: {"track_id": 7}}}
+    payload_path.write_bytes(zlib.compress(pickle.dumps(expected_payload)))
+
+    loaded_payload = load_native_track_payload(payload_path)
+
+    assert loaded_payload == expected_payload
+
+
+def test_load_native_track_payload_handles_zlib_compressed_joblib(tmp_path: Path) -> None:
+    payload_path = tmp_path / "demo_frames.pkl"
+    expected_payload = {"frame_000001.jpg": {"tid": [7], "bbox": [np.array([1, 2, 3, 4], dtype=np.float32)]}}
+    payload_buffer = BytesIO()
+    joblib.dump(expected_payload, payload_buffer)
+    payload_path.write_bytes(zlib.compress(payload_buffer.getvalue()))
+
+    loaded_payload = load_native_track_payload(payload_path)
+
+    assert list(loaded_payload.keys()) == ["frame_000001.jpg"]
+
+
+def test_stage_fourdhumans_source_frames_converts_png_inputs_to_jpg(tmp_path: Path) -> None:
+    frame_records: list[GammaFrameRecord] = []
+    for index, segment in enumerate(("preroll", "demo", "demo")):
+        image_path = tmp_path / f"frame_{index:06d}.png"
+        image = np.full((8, 8, 3), 32 * (index + 1), dtype=np.uint8)
+        from PIL import Image
+        Image.fromarray(image, mode="RGB").save(image_path)
+        frame_records.append(
+            GammaFrameRecord(
+                frame_idx=index,
+                frame_name=image_path.name,
+                image_path=image_path,
+                pts_sec=float(index),
+                t_ns=index * 1_000_000_000,
+                segment=segment,
+                pose_status="registered",
+            )
+        )
+
+    staged_dir = stage_fourdhumans_source_frames(frame_records, tmp_path / "staged_frames")
+
+    staged_names = sorted(path.name for path in staged_dir.glob("*.jpg"))
+    assert staged_names == [f"frame_{index:06d}.jpg" for index in range(len(frame_records))]
+
+
+def test_normalize_fourdhumans_tracks_accepts_frame_indexed_native_payload(tmp_path: Path) -> None:
+    frame_records = _frame_records(tmp_path)
+    image_size = [1080, 1920]
+    joints2d = np.tile(np.array([0.5, 0.5], dtype=np.float32), 45)
+    joints3d = np.zeros((45, 3), dtype=np.float32)
+    native_payload = {
+        str(frame_records[1].image_path.with_suffix(".jpg")): {
+            "time": 1,
+            "tid": [7],
+            "bbox": [np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32)],
+            "conf": [np.float32(0.95)],
+            "smpl": [{"global_orient": np.zeros(3, dtype=np.float32), "body_pose": np.zeros(69, dtype=np.float32), "betas": np.zeros(10, dtype=np.float32)}],
+            "3d_joints": [joints3d],
+            "2d_joints": [joints2d],
+            "size": image_size,
+        }
+    }
+
+    normalized = normalize_fourdhumans_tracks(
+        native_payload=native_payload,
+        frame_records=frame_records,
+        camera_pose_map=_camera_pose_map(),
+        video_id="demo_0001",
+    )
+
+    normalized_frame = normalized["tracks"][7]["frames"][0]
+    assert normalized_frame["frame_idx"] == 1
+    assert normalized_frame["bbox_xyxy"].tolist() == pytest.approx([10.0, 20.0, 40.0, 60.0])
+    assert normalized_frame["joints2d_xyc"].shape == (45, 3)
 
 
 @pytest.mark.skipif(

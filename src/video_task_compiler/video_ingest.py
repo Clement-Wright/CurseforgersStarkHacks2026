@@ -345,6 +345,12 @@ def _link_or_copy(source: Path, destination: Path) -> None:
         shutil.copy2(source, destination)
 
 
+def reset_directory(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
 def stage_frame_subset(records: Sequence[FrameRecord], target_dir: Path, segment_names: set[str]) -> list[FrameRecord]:
     target_dir.mkdir(parents=True, exist_ok=True)
     selected = [record for record in records if record.segment in segment_names or record.is_keyframe and "keyframes" in segment_names]
@@ -353,11 +359,32 @@ def stage_frame_subset(records: Sequence[FrameRecord], target_dir: Path, segment
     return selected
 
 
-def run_command(command: list[str], cwd: Path | None = None) -> None:
-    result = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
+def colmap_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    # OpenCV wheels may set Qt plugin paths that break the system COLMAP binary.
+    for key in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_PLUGIN_PATH", "QT_QPA_FONTDIR"):
+        env.pop(key, None)
+    env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    return env
+
+
+def run_command(command: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
+    result = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "unknown subprocess failure"
         raise VideoIngestError(f"command failed: {' '.join(command)} :: {detail}")
+
+
+def should_use_colmap_gpu(mode: str) -> bool:
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible_devices is not None and cuda_visible_devices.strip() == "":
+        return False
+    return shutil.which("nvidia-smi") is not None
 
 
 def parse_cameras_txt(path: Path) -> dict[int, ColmapCamera]:
@@ -451,7 +478,8 @@ def convert_model_to_text(colmap_bin: str, input_dir: Path, output_dir: Path) ->
             str(output_dir),
             "--output_type",
             "TXT",
-        ]
+        ],
+        env=colmap_subprocess_env(),
     )
     return load_text_model(output_dir, input_dir.name)
 
@@ -482,6 +510,11 @@ def choose_largest_sparse_component(
     return best_model, best_sparse_dir, len(candidates)
 
 
+def write_image_list(path: Path, records: Sequence[FrameRecord]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{record.frame_name}\n" for record in records), encoding="utf-8")
+
+
 def run_colmap_pipeline(
     colmap_bin: str,
     frames_dir: Path,
@@ -497,48 +530,74 @@ def run_colmap_pipeline(
     mapper_text_dir = staging_dir / "mapper_text"
     preroll_dir = staging_dir / "preroll_images"
     localization_dir = staging_dir / "localization_images"
+    preroll_list_path = staging_dir / "preroll_images.txt"
+    localization_list_path = staging_dir / "localization_images.txt"
     base_model_dir = sparse_root / "base"
     final_model_dir = sparse_root / "final"
     base_text_dir = sparse_text_root / "base"
     final_text_dir = sparse_text_root / "final"
 
+    if database_path.exists():
+        database_path.unlink()
     for path in (sparse_root, sparse_text_root, staging_dir):
         path.mkdir(parents=True, exist_ok=True)
+    for path in (mapper_candidates_dir, mapper_text_dir, preroll_dir, localization_dir):
+        reset_directory(path)
 
     preroll_records = [record for record in records if record.is_keyframe]
     localization_records = [record for record in records if record.segment != "preroll"]
     if not preroll_records:
         raise VideoIngestError("no pre-roll keyframes were available for COLMAP reconstruction")
 
+    write_image_list(preroll_list_path, preroll_records)
+    write_image_list(localization_list_path, localization_records)
     stage_frame_subset(preroll_records, preroll_dir, {"preroll", "keyframes"})
     stage_frame_subset(localization_records, localization_dir, {"demo", "postroll"})
+    use_gpu = should_use_colmap_gpu(capture.beta.colmap.use_gpu)
+    gpu_flag = "1" if use_gpu else "0"
+    colmap_env = colmap_subprocess_env()
 
-    run_command(
-        [
-            colmap_bin,
-            "feature_extractor",
-            "--database_path",
-            str(database_path),
-            "--image_path",
-            str(frames_dir),
-            "--ImageReader.camera_model",
-            capture.beta.colmap.camera_model,
-            "--ImageReader.single_camera",
-            "1",
-            "--SiftExtraction.use_gpu",
-            "0",
-        ]
-    )
-    run_command(
-        [
-            colmap_bin,
-            "sequential_matcher",
-            "--database_path",
-            str(database_path),
-            "--SiftMatching.use_gpu",
-            "0",
-        ]
-    )
+    feature_extractor_command = [
+        colmap_bin,
+        "feature_extractor",
+        "--database_path",
+        str(database_path),
+        "--image_path",
+        str(frames_dir),
+        "--image_list_path",
+        str(preroll_list_path),
+        "--ImageReader.camera_model",
+        capture.beta.colmap.camera_model,
+        "--ImageReader.single_camera",
+        "1",
+        "--SiftExtraction.use_gpu",
+        gpu_flag,
+    ]
+    if use_gpu:
+        feature_extractor_command.extend(
+            [
+                "--SiftExtraction.gpu_index",
+                str(capture.beta.colmap.gpu_index),
+            ]
+        )
+    run_command(feature_extractor_command, env=colmap_env)
+
+    sequential_matcher_command = [
+        colmap_bin,
+        "sequential_matcher",
+        "--database_path",
+        str(database_path),
+        "--SiftMatching.use_gpu",
+        gpu_flag,
+    ]
+    if use_gpu:
+        sequential_matcher_command.extend(
+            [
+                "--SiftMatching.gpu_index",
+                str(capture.beta.colmap.gpu_index),
+            ]
+        )
+    run_command(sequential_matcher_command, env=colmap_env)
     run_command(
         [
             colmap_bin,
@@ -549,7 +608,8 @@ def run_colmap_pipeline(
             str(preroll_dir),
             "--output_path",
             str(mapper_candidates_dir),
-        ]
+        ],
+        env=colmap_env,
     )
 
     base_model, base_sparse_candidate, component_count = choose_largest_sparse_component(
@@ -569,19 +629,44 @@ def run_colmap_pipeline(
         shutil.rmtree(final_model_dir)
 
     if any(localization_dir.iterdir()):
+        localization_feature_extractor_command = [
+            colmap_bin,
+            "feature_extractor",
+            "--database_path",
+            str(database_path),
+            "--image_path",
+            str(frames_dir),
+            "--image_list_path",
+            str(localization_list_path),
+            "--ImageReader.camera_model",
+            capture.beta.colmap.camera_model,
+            "--ImageReader.single_camera",
+            "1",
+            "--SiftExtraction.use_gpu",
+            gpu_flag,
+        ]
+        if use_gpu:
+            localization_feature_extractor_command.extend(
+                [
+                    "--SiftExtraction.gpu_index",
+                    str(capture.beta.colmap.gpu_index),
+                ]
+            )
+        run_command(localization_feature_extractor_command, env=colmap_env)
+        run_command(sequential_matcher_command, env=colmap_env)
+        final_model_dir.mkdir(parents=True, exist_ok=True)
         run_command(
             [
                 colmap_bin,
                 "image_registrator",
                 "--database_path",
                 str(database_path),
-                "--image_path",
-                str(localization_dir),
                 "--input_path",
                 str(base_model_dir),
                 "--output_path",
                 str(final_model_dir),
-            ]
+            ],
+            env=colmap_env,
         )
     else:
         shutil.copytree(base_model_dir, final_model_dir)
