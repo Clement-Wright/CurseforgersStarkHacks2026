@@ -121,6 +121,7 @@ def test_normalize_fourdhumans_tracks_preserves_frame_idx_and_t_ns(tmp_path: Pat
 
 
 def test_select_primary_track_prefers_coverage_then_confidence_then_bbox(tmp_path: Path) -> None:
+    frame_records = [record for record in _frame_records(tmp_path) if record.segment != "preroll"]
     normalized = normalize_fourdhumans_tracks(
         native_payload=_native_payload(),
         frame_records=_frame_records(tmp_path),
@@ -128,7 +129,7 @@ def test_select_primary_track_prefers_coverage_then_confidence_then_bbox(tmp_pat
         video_id="demo_0001",
     )
 
-    selection = select_primary_demonstrator_track(normalized, _frame_records(tmp_path))
+    selection = select_primary_demonstrator_track(normalized, frame_records)
 
     assert selection.track_id == 7
     assert selection.completeness == pytest.approx(1.0)
@@ -174,8 +175,8 @@ def test_smoothing_does_not_mutate_normalized_track_payload(tmp_path: Path) -> N
     assert smoothed[1]["wrist_r_x"] is not None
 
 
-def test_sample_overlay_frames_uses_active_segment_only(tmp_path: Path) -> None:
-    frame_records = _frame_records(tmp_path)
+def test_sample_overlay_frames_use_the_supplied_window(tmp_path: Path) -> None:
+    frame_records = [record for record in _frame_records(tmp_path) if record.segment != "preroll"]
 
     sampled = sample_overlay_frame_indices(frame_records, overlay_count=2)
 

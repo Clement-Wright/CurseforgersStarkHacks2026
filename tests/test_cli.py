@@ -599,10 +599,15 @@ def test_human_extract_success_writes_gamma_outputs(
             str(beta_dir),
             "--out-dir",
             str(out_dir),
+            "--task-start-frame",
+            "1",
+            "--task-end-frame",
+            "3",
         ],
     )
 
     assert result.exit_code == 0
+    assert (out_dir / "task_window.json").exists()
     assert (out_dir / "human" / "native" / "4dhumans_tracks.pkl").exists()
     assert (out_dir / "human" / "smpl_tracks.pkl").exists()
     assert (out_dir / "human" / "arm_observables.parquet").exists()
@@ -612,6 +617,34 @@ def test_human_extract_success_writes_gamma_outputs(
     assert table.num_rows == 4
     summary = json.loads((out_dir / "human" / "summary.json").read_text(encoding="utf-8"))
     assert summary["primary_track_id"] == 7
+    assert summary["task_window"]["start_frame_idx"] == 1
+    assert summary["primary_track_completeness_full_clip"] == pytest.approx(1.0)
+    assert summary["primary_track_completeness_task_window"] == pytest.approx(1.0)
+
+
+def test_human_extract_requires_both_task_window_bounds(tmp_path: Path) -> None:
+    bundle_root = _write_beta_friendly_bundle_root(tmp_path / "bundle")
+    beta_dir = tmp_path / "beta"
+    _write_gamma_beta_artifacts(beta_dir)
+
+    result = runner.invoke(
+        app,
+        [
+            "human",
+            "extract-monocular",
+            "--spec-dir",
+            str(bundle_root / "spec"),
+            "--beta-dir",
+            str(beta_dir),
+            "--out-dir",
+            str(tmp_path / "gamma"),
+            "--task-start-frame",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "both --task-start-frame and --task-end-frame must be provided together" in result.stdout
 
 
 def test_discover_native_track_file_falls_back_to_upstream_results_dir(tmp_path: Path) -> None:

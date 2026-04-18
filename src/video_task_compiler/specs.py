@@ -298,6 +298,11 @@ class ProjectAcceptanceSpec(BaseModel):
     delta_max_duplicate_ids_in_review_sample: int = Field(ge=0)
     delta_min_mask_iou_sample: float = Field(gt=0.0, le=1.0)
     delta_require_rle_decode_success: bool
+    epsilon_max_support_plane_rmse_m: float = Field(ge=0.0)
+    epsilon_max_scale_anchor_rel_error: float = Field(ge=0.0)
+    zeta_max_collision_geoms_per_object: int = Field(ge=1)
+    eta_min_demo_frames: int = Field(ge=1)
+    eta_max_joint_step_rad: float = Field(gt=0.0)
 
 
 class ProjectGammaSmoothingSpec(BaseModel):
@@ -335,6 +340,37 @@ class ProjectDeltaSpec(BaseModel):
     mask_encoding: Literal["coco_rle"]
 
 
+class ProjectEpsilonSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    primary_backbone: Literal["artifact_fusion"]
+    preserve_beta_world: Literal[True]
+    metric_world_frame: Literal["M"]
+    support_plane_source: Literal["task_regions"]
+    default_object_height_m: float = Field(gt=0.0)
+    qc_overlay_frame_count: int = Field(ge=1)
+
+
+class ProjectZetaSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    primary_backbone: Literal["mujoco_safe_assets"]
+    collision_strategy: Literal["obb_single"]
+    max_collision_geoms_per_object: int = Field(ge=1)
+
+
+class ProjectEtaSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    primary_backbone: Literal["heuristic_ik"]
+    retarget_mode: Literal["planar_pick_place"]
+    pregrasp_clearance_m: float = Field(gt=0.0)
+    transport_clearance_m: float = Field(gt=0.0)
+    postplace_clearance_m: float = Field(gt=0.0)
+    waypoint_hold_s: float = Field(gt=0.0)
+    hdf5_export_policy: Literal["best_effort"]
+
+
 class ProjectSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -353,6 +389,9 @@ class ProjectSpec(BaseModel):
     metric_scale_policy: Literal["fiducial_marker"]
     gamma: ProjectGammaSpec
     delta: ProjectDeltaSpec
+    epsilon: ProjectEpsilonSpec
+    zeta: ProjectZetaSpec
+    eta: ProjectEtaSpec
     ontology: ProjectOntologyRefsSpec
     sponsor_resources: list[str] = Field(min_length=1)
     acceptance: ProjectAcceptanceSpec
@@ -929,6 +968,78 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
                 bundle.project_path,
                 "delta.mask_encoding",
                 "delta masks must be serialized as coco_rle",
+            )
+        )
+
+    if bundle.project.epsilon.primary_backbone != "artifact_fusion":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "epsilon.primary_backbone",
+                "epsilon currently supports only the artifact_fusion backbone",
+            )
+        )
+
+    if not bundle.project.epsilon.preserve_beta_world:
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "epsilon.preserve_beta_world",
+                "epsilon must preserve beta's world frame and emit an explicit metric transform artifact",
+            )
+        )
+
+    if bundle.project.epsilon.support_plane_source != "task_regions":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "epsilon.support_plane_source",
+                "epsilon currently supports only task_regions support-plane initialization",
+            )
+        )
+
+    if bundle.project.zeta.primary_backbone != "mujoco_safe_assets":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "zeta.primary_backbone",
+                "zeta currently supports only the mujoco_safe_assets backbone",
+            )
+        )
+
+    if bundle.project.zeta.collision_strategy != "obb_single":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "zeta.collision_strategy",
+                "zeta currently supports only single-OBB collision assets",
+            )
+        )
+
+    if bundle.project.zeta.max_collision_geoms_per_object > bundle.project.acceptance.zeta_max_collision_geoms_per_object:
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "zeta.max_collision_geoms_per_object",
+                "zeta.max_collision_geoms_per_object must not exceed acceptance.zeta_max_collision_geoms_per_object",
+            )
+        )
+
+    if bundle.project.eta.primary_backbone != "heuristic_ik":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "eta.primary_backbone",
+                "eta currently supports only the heuristic_ik backbone",
+            )
+        )
+
+    if bundle.project.eta.retarget_mode != "planar_pick_place":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "eta.retarget_mode",
+                "eta currently supports only planar_pick_place retargeting",
             )
         )
 

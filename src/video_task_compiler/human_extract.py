@@ -21,6 +21,13 @@ import pyarrow.parquet as pq
 from PIL import Image, ImageDraw
 
 from .specs import PROJECT_SCHEMA_VERSION, SpecBundle
+from .task_window import (
+    TaskWindow,
+    TaskWindowError,
+    filter_items_to_task_window,
+    persist_task_window,
+    resolve_task_window,
+)
 
 
 class HumanExtractError(Exception):
@@ -733,14 +740,13 @@ def _track_frame_lookup(track_payload: dict[str, Any]) -> dict[int, dict[str, An
 
 def count_primary_id_switches(
     normalized_payload: dict[str, Any],
-    frame_records: Sequence[GammaFrameRecord],
+    scored_frame_records: Sequence[GammaFrameRecord],
 ) -> int:
-    active_frames = [frame for frame in frame_records if frame.segment != "preroll"]
     tracks = normalized_payload["tracks"]
     last_track_id: int | None = None
     switch_count = 0
 
-    for frame in active_frames:
+    for frame in scored_frame_records:
         best_track_id: int | None = None
         best_score: tuple[float, float] | None = None
         for track_id, track_payload in tracks.items():
@@ -765,22 +771,22 @@ def count_primary_id_switches(
 
 def select_primary_demonstrator_track(
     normalized_payload: dict[str, Any],
-    frame_records: Sequence[GammaFrameRecord],
+    scored_frame_records: Sequence[GammaFrameRecord],
 ) -> PrimaryTrackSelection:
-    active_frames = [frame for frame in frame_records if frame.segment != "preroll"]
-    if not active_frames:
-        raise HumanExtractError("gamma could not find any active non-preroll frames")
+    if not scored_frame_records:
+        raise HumanExtractError("gamma could not find any frames in the resolved task window")
 
     best_track_id: int | None = None
     best_tuple: tuple[float, float, float] | None = None
     tracks = normalized_payload["tracks"]
+    scored_indices = {frame.frame_idx for frame in scored_frame_records}
 
     for track_id, track_payload in tracks.items():
         track_frames = [
             frame for frame in track_payload["frames"]
-            if frame["segment"] != "preroll"
+            if int(frame["frame_idx"]) in scored_indices
         ]
-        coverage = len(track_frames) / len(active_frames)
+        coverage = len(track_frames) / len(scored_frame_records)
         wrist_conf_values = [
             float(frame["visibility"].get("right_wrist", 0.0))
             for frame in track_frames
@@ -802,7 +808,7 @@ def select_primary_demonstrator_track(
         completeness=best_tuple[0],
         median_wrist_confidence=best_tuple[1],
         median_bbox_area=best_tuple[2],
-        id_switch_count=count_primary_id_switches(normalized_payload, frame_records),
+        id_switch_count=count_primary_id_switches(normalized_payload, scored_frame_records),
     )
     normalized_payload["tracks"][best_track_id]["is_primary_demonstrator"] = True
     normalized_payload["tracks"][best_track_id]["track_score"] = float(selection.completeness)
@@ -1048,15 +1054,15 @@ def sample_overlay_frame_indices(
     frame_records: Sequence[GammaFrameRecord],
     overlay_count: int,
 ) -> list[int]:
-    active_indices = [frame.frame_idx for frame in frame_records if frame.segment != "preroll"]
-    if not active_indices:
+    frame_indices = [frame.frame_idx for frame in frame_records]
+    if not frame_indices:
         return []
-    if len(active_indices) <= overlay_count:
-        return active_indices
-    sampled = np.linspace(0, len(active_indices) - 1, overlay_count)
+    if len(frame_indices) <= overlay_count:
+        return frame_indices
+    sampled = np.linspace(0, len(frame_indices) - 1, overlay_count)
     deduped: list[int] = []
     for sample in sampled:
-        frame_idx = active_indices[int(round(float(sample)))]
+        frame_idx = frame_indices[int(round(float(sample)))]
         if frame_idx not in deduped:
             deduped.append(frame_idx)
     return deduped
@@ -1127,35 +1133,74 @@ def write_observables_parquet(path: Path, rows: Sequence[dict[str, Any]]) -> Non
     pq.write_table(table, path)
 
 
+def _track_coverage_fraction(
+    track_payload: dict[str, Any],
+    frame_records: Sequence[GammaFrameRecord],
+) -> tuple[float, int]:
+    if not frame_records:
+        return 0.0, 0
+    scored_indices = {frame.frame_idx for frame in frame_records}
+    visible_count = sum(
+        1 for frame in track_payload["frames"] if int(frame["frame_idx"]) in scored_indices
+    )
+    return visible_count / len(frame_records), len(frame_records) - visible_count
+
+
+def _world_estimate_coverage_fraction(
+    observables_rows: Sequence[dict[str, Any]],
+    frame_records: Sequence[GammaFrameRecord],
+) -> float:
+    if not frame_records:
+        return 0.0
+    scored_indices = {frame.frame_idx for frame in frame_records}
+    available_count = sum(
+        1
+        for row in observables_rows
+        if int(row["frame_idx"]) in scored_indices and row.get("world_estimate_status") == "available"
+    )
+    return available_count / len(frame_records)
+
+
 def build_gamma_summary(
     bundle: SpecBundle,
     frame_records: Sequence[GammaFrameRecord],
+    task_window_frame_records: Sequence[GammaFrameRecord],
     primary_track: dict[str, Any],
     selection: PrimaryTrackSelection,
     observables_rows: Sequence[dict[str, Any]],
+    task_window: TaskWindow,
 ) -> dict[str, Any]:
-    active_frames = [frame for frame in frame_records if frame.segment != "preroll"]
-    world_estimate_available = sum(
-        1 for row in observables_rows
-        if row["segment"] != "preroll" and row.get("world_estimate_status") == "available"
-    )
-    missing_frame_count = sum(
-        1 for row in observables_rows
-        if row["segment"] != "preroll" and not row.get("track_visible", False)
+    full_clip_frame_records = [frame for frame in frame_records if frame.segment != "preroll"]
+    full_clip_completeness, full_clip_missing = _track_coverage_fraction(primary_track, full_clip_frame_records)
+    task_window_completeness, task_window_missing = _track_coverage_fraction(primary_track, task_window_frame_records)
+    full_clip_world_coverage = _world_estimate_coverage_fraction(observables_rows, full_clip_frame_records)
+    task_window_world_coverage = _world_estimate_coverage_fraction(observables_rows, task_window_frame_records)
+    full_clip_id_switch_count = count_primary_id_switches(
+        {"tracks": {int(primary_track["track_id"]): primary_track}},
+        full_clip_frame_records,
     )
     summary = {
         "schema_version": PROJECT_SCHEMA_VERSION,
         "video_id": bundle.project.video_id,
         "source": "4DHumans",
+        "task_window": task_window.to_payload(video_id=bundle.project.video_id),
         "primary_track_id": selection.track_id,
-        "primary_track_completeness": selection.completeness,
+        "primary_track_completeness": task_window_completeness,
+        "primary_track_completeness_full_clip": full_clip_completeness,
+        "primary_track_completeness_task_window": task_window_completeness,
         "median_wrist_confidence": selection.median_wrist_confidence,
         "id_switch_count": selection.id_switch_count,
-        "missing_frame_count": missing_frame_count,
-        "world_estimate_coverage": world_estimate_available / len(active_frames) if active_frames else 0.0,
+        "id_switch_count_full_clip": full_clip_id_switch_count,
+        "id_switch_count_task_window": selection.id_switch_count,
+        "missing_frame_count": task_window_missing,
+        "missing_frame_count_full_clip": full_clip_missing,
+        "missing_frame_count_task_window": task_window_missing,
+        "world_estimate_coverage": task_window_world_coverage,
+        "world_estimate_coverage_full_clip": full_clip_world_coverage,
+        "world_estimate_coverage_task_window": task_window_world_coverage,
         "track_count": len(primary_track.get("frames", [])),
         "qc_flags": {
-            "primary_track_fraction_ok": selection.completeness >= bundle.project.acceptance.gamma_min_primary_track_fraction,
+            "primary_track_fraction_ok": task_window_completeness >= bundle.project.acceptance.gamma_min_primary_track_fraction,
             "wrist_confidence_ok": selection.median_wrist_confidence >= bundle.project.acceptance.gamma_min_median_wrist_confidence,
             "id_switches_ok": selection.id_switch_count <= bundle.project.acceptance.gamma_max_id_switches,
         },
@@ -1186,11 +1231,9 @@ def extract_monocular_human_motion(
     smpl_model_path: Path | None = None,
     device: str = "cuda",
     keep_workdir: bool = False,
+    task_start_frame: int | None = None,
+    task_end_frame: int | None = None,
 ) -> dict[str, Any]:
-    resolved_fourdhumans_root, resolved_smpl_model_path = ensure_gamma_dependencies(
-        fourdhumans_root, smpl_model_path
-    )
-
     frames_dir = beta_dir / "frames"
     frame_index_path = frames_dir / "index.csv"
     camera_pose_path = beta_dir / "camera" / "camera_poses.json"
@@ -1201,6 +1244,20 @@ def extract_monocular_human_motion(
     frame_records = load_frame_index_csv(frame_index_path)
     camera_pose_map = load_camera_pose_map(camera_pose_path)
     intrinsics = load_camera_intrinsics(intrinsics_path)
+    try:
+        task_window = resolve_task_window(
+            frame_records,
+            video_id=bundle.project.video_id,
+            artifact_roots=(out_dir, beta_dir),
+            task_start_frame=task_start_frame,
+            task_end_frame=task_end_frame,
+        )
+    except TaskWindowError as exc:
+        raise HumanExtractError(str(exc)) from exc
+    task_window_frame_records = filter_items_to_task_window(frame_records, task_window)
+    resolved_fourdhumans_root, resolved_smpl_model_path = ensure_gamma_dependencies(
+        fourdhumans_root, smpl_model_path
+    )
 
     human_root = out_dir / "human"
     native_dir = human_root / "native"
@@ -1208,6 +1265,7 @@ def extract_monocular_human_motion(
     work_dir = human_root / "_workdir"
     human_root.mkdir(parents=True, exist_ok=True)
     native_dir.mkdir(parents=True, exist_ok=True)
+    persist_task_window(task_window, out_dir, video_id=bundle.project.video_id)
     staged_frames_dir = stage_fourdhumans_source_frames(frame_records, work_dir / "_source_frames_jpg")
 
     native_track_path = run_fourdhumans_tracking(
@@ -1227,7 +1285,7 @@ def extract_monocular_human_motion(
         camera_pose_map=camera_pose_map,
         video_id=bundle.project.video_id,
     )
-    selection = select_primary_demonstrator_track(normalized_payload, frame_records)
+    selection = select_primary_demonstrator_track(normalized_payload, task_window_frame_records)
     primary_track = normalized_payload["tracks"][selection.track_id]
     observables_rows = build_arm_observables_rows(
         bundle=bundle,
@@ -1241,7 +1299,7 @@ def extract_monocular_human_motion(
     write_observables_parquet(human_root / "arm_observables.parquet", observables_rows)
     write_reprojection_overlays(
         overlay_dir=overlay_dir,
-        frame_records=frame_records,
+        frame_records=task_window_frame_records,
         primary_track=primary_track,
         camera_pose_map=camera_pose_map,
         intrinsics=intrinsics,
@@ -1251,9 +1309,11 @@ def extract_monocular_human_motion(
     summary = build_gamma_summary(
         bundle=bundle,
         frame_records=frame_records,
+        task_window_frame_records=task_window_frame_records,
         primary_track=primary_track,
         selection=selection,
         observables_rows=observables_rows,
+        task_window=task_window,
     )
     (human_root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 

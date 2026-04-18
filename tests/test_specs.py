@@ -30,6 +30,9 @@ def test_checked_in_bundle_validates() -> None:
     assert bundle.project.capture.preroll_seconds == pytest.approx(10.0)
     assert bundle.project.gamma.primary_backbone == "fourdhumans"
     assert bundle.project.delta.primary_backbone == "grounded_sam2"
+    assert bundle.project.epsilon.primary_backbone == "artifact_fusion"
+    assert bundle.project.zeta.primary_backbone == "mujoco_safe_assets"
+    assert bundle.project.eta.primary_backbone == "heuristic_ik"
     assert bundle.task.pick_object.ontology_id == "target_object"
     assert bundle.capture.beta.normalization.world_frame == "fiducial_center"
     assert bundle.env_specs["sfm"].name == "video-task-compiler-sfm"
@@ -127,6 +130,19 @@ def test_missing_delta_block_reports_targeted_error(tmp_path: Path) -> None:
     assert any(issue.field_path == "delta" for issue in excinfo.value.issues)
 
 
+def test_missing_epsilon_block_reports_targeted_error(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    project_path = bundle_root / "spec" / "project.yaml"
+    project_data = _load_yaml(project_path)
+    del project_data["epsilon"]
+    _write_yaml(project_path, project_data)
+
+    with pytest.raises(SpecValidationError) as excinfo:
+        load_bundle(bundle_root / "spec")
+
+    assert any(issue.field_path == "epsilon" for issue in excinfo.value.issues)
+
+
 def test_invalid_gamma_acceptance_threshold_is_rejected(tmp_path: Path) -> None:
     bundle_root = _copy_bundle_root(tmp_path / "bundle")
     project_path = bundle_root / "spec" / "project.yaml"
@@ -151,6 +167,19 @@ def test_invalid_delta_acceptance_threshold_is_rejected(tmp_path: Path) -> None:
         load_bundle(bundle_root / "spec")
 
     assert any(issue.field_path == "acceptance.delta_max_duplicate_ids_in_review_sample" for issue in excinfo.value.issues)
+
+
+def test_invalid_eta_acceptance_threshold_is_rejected(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    project_path = bundle_root / "spec" / "project.yaml"
+    project_data = _load_yaml(project_path)
+    project_data["acceptance"]["eta_max_joint_step_rad"] = 0.0
+    _write_yaml(project_path, project_data)
+
+    with pytest.raises(SpecValidationError) as excinfo:
+        load_bundle(bundle_root / "spec")
+
+    assert any(issue.field_path == "acceptance.eta_max_joint_step_rad" for issue in excinfo.value.issues)
 
 
 def test_task_regions_must_stay_inside_workspace(tmp_path: Path) -> None:

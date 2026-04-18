@@ -19,6 +19,13 @@ import yaml
 from PIL import Image, ImageDraw
 
 from .specs import PROJECT_SCHEMA_VERSION, SpecBundle
+from .task_window import (
+    TaskWindow,
+    TaskWindowError,
+    filter_items_to_task_window,
+    persist_task_window,
+    resolve_task_window,
+)
 
 
 class ObjectExtractError(Exception):
@@ -749,12 +756,15 @@ def build_interaction_rows(
     normalized_payload: dict[str, Any],
     masks_by_track_frame: dict[tuple[str, int], np.ndarray],
     wrist_observations: dict[int, WristObservation],
+    task_window: TaskWindow,
 ) -> list[dict[str, Any]]:
     kind_lookup = {entity.id: entity.kind for entity in bundle.ontology.entities}
     rows: list[dict[str, Any]] = []
     for track in normalized_payload.get("tracks", []):
         ontology_kind = kind_lookup.get(track["ontology_id"], "object")
         for frame in track["frames"]:
+            if not task_window.contains(int(frame["frame_idx"])):
+                continue
             centroid = frame.get("centroid_uv") or [None, None]
             wrist = wrist_observations.get(int(frame["frame_idx"]))
             wrist_u = wrist.wrist_u if wrist is not None else None
@@ -804,13 +814,13 @@ def sample_active_overlay_indices(
     frame_records: Sequence[DeltaFrameRecord],
     overlay_count: int,
 ) -> list[int]:
-    active_indices = [record.frame_idx for record in frame_records if record.segment != "preroll"]
-    if len(active_indices) <= overlay_count:
-        return active_indices
-    sampled = np.linspace(0, len(active_indices) - 1, overlay_count)
+    frame_indices = [record.frame_idx for record in frame_records]
+    if len(frame_indices) <= overlay_count:
+        return frame_indices
+    sampled = np.linspace(0, len(frame_indices) - 1, overlay_count)
     deduped: list[int] = []
     for sample in sampled:
-        frame_idx = active_indices[int(round(float(sample)))]
+        frame_idx = frame_indices[int(round(float(sample)))]
         if frame_idx not in deduped:
             deduped.append(frame_idx)
     return deduped
@@ -968,6 +978,7 @@ def build_delta_summary(
     review_frame_indices: Sequence[int],
     *,
     rle_decode_success: bool,
+    task_window: TaskWindow,
 ) -> dict[str, Any]:
     track_counts_by_class: dict[str, int] = {prompt.ontology_id: 0 for prompt in prompts}
     for track in normalized_payload.get("tracks", []):
@@ -989,6 +1000,7 @@ def build_delta_summary(
         "schema_version": PROJECT_SCHEMA_VERSION,
         "video_id": bundle.project.video_id,
         "source": bundle.project.delta.primary_backbone,
+        "task_window": task_window.to_payload(video_id=bundle.project.video_id),
         "selected_seed_frame": {
             "frame_idx": seed_frame.frame_idx,
             "frame_name": seed_frame.frame_name,
@@ -1048,9 +1060,9 @@ def extract_monocular_objects(
     *,
     device: str = "cuda",
     keep_workdir: bool = False,
+    task_start_frame: int | None = None,
+    task_end_frame: int | None = None,
 ) -> dict[str, Any]:
-    resolved_grounded_sam2_root = ensure_delta_dependencies(grounded_sam2_root)
-
     frames_dir = beta_dir / "frames"
     frame_index_path = frames_dir / "index.csv"
     camera_pose_path = beta_dir / "camera" / "camera_poses.json"
@@ -1064,12 +1076,26 @@ def extract_monocular_objects(
     frame_records = load_frame_index_csv(frame_index_path)
     load_camera_pose_payload(camera_pose_path)
     prompts = build_object_prompt_specs(bundle)
+    gamma_root = gamma_dir.resolve() if gamma_dir is not None and gamma_dir.exists() else beta_dir.resolve()
+    try:
+        task_window = resolve_task_window(
+            frame_records,
+            video_id=bundle.project.video_id,
+            artifact_roots=(gamma_root, beta_dir, out_dir),
+            task_start_frame=task_start_frame,
+            task_end_frame=task_end_frame,
+        )
+    except TaskWindowError as exc:
+        raise ObjectExtractError(str(exc)) from exc
+    task_window_frame_records = filter_items_to_task_window(frame_records, task_window)
+    resolved_grounded_sam2_root = ensure_delta_dependencies(grounded_sam2_root)
 
     objects_root = out_dir / "objects"
     overlays_dir = objects_root / "overlays"
     work_dir = objects_root / "_workdir"
     objects_root.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
+    persist_task_window(task_window, out_dir, video_id=bundle.project.video_id)
 
     preroll_candidates = sample_segment_frames(
         frame_records,
@@ -1114,17 +1140,17 @@ def extract_monocular_objects(
         frame_records=frame_records,
         prompts=prompts,
     )
-    gamma_root = gamma_dir.resolve() if gamma_dir is not None and gamma_dir.exists() else beta_dir.resolve()
     wrist_observations = load_optional_gamma_wrist_observations(gamma_root if gamma_root.exists() else None)
     interaction_rows = build_interaction_rows(
         bundle=bundle,
         normalized_payload=normalized_payload,
         masks_by_track_frame=masks_by_track_frame,
         wrist_observations=wrist_observations,
+        task_window=task_window,
     )
     review_frame_indices = write_object_overlays(
         overlay_dir=overlays_dir,
-        frame_records=frame_records,
+        frame_records=task_window_frame_records,
         normalized_payload=normalized_payload,
         masks_by_track_frame=masks_by_track_frame,
         wrist_observations=wrist_observations,
@@ -1148,6 +1174,7 @@ def extract_monocular_objects(
         interaction_rows=interaction_rows,
         review_frame_indices=review_frame_indices,
         rle_decode_success=rle_decode_success,
+        task_window=task_window,
     )
     (objects_root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 

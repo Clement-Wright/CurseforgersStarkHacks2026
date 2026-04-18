@@ -26,6 +26,7 @@ from video_task_compiler.object_extract import (
     normalize_grounded_sam2_tracks,
 )
 from video_task_compiler.specs import load_bundle, validate_bundle
+from video_task_compiler.task_window import TaskWindow
 
 
 runner = CliRunner()
@@ -328,6 +329,7 @@ def test_build_interaction_rows_obeys_distance_and_confidence_thresholds() -> No
         normalized_payload=normalized_payload,
         masks_by_track_frame={("obj_target", 1): mask},
         wrist_observations={1: WristObservation(1, 1_000_000_000, 2.0, 2.0, 0.9)},
+        task_window=TaskWindow(start_frame_idx=1, end_frame_idx=1, source="cli_override"),
     )
 
     assert interaction_rows[0]["pixel_distance_wrist_to_mask"] == pytest.approx(0.0)
@@ -369,6 +371,7 @@ def test_extract_monocular_objects_success_writes_delta_outputs(
     )
 
     assert summary["qc_flags"]["all_ontology_entities_tracked"] is True
+    assert (out_dir / "task_window.json").exists()
     assert (out_dir / "objects" / "prompts.yaml").exists()
     assert (out_dir / "objects" / "object_tracks.json").exists()
     assert (out_dir / "objects" / "masks_rle.jsonl").exists()
@@ -386,6 +389,61 @@ def test_extract_monocular_objects_success_writes_delta_outputs(
 
     seen_pairs = {(row["track_id"], row["frame_idx"]) for row in interaction_rows}
     assert len(seen_pairs) == len(interaction_rows)
+
+
+def test_extract_monocular_objects_uses_persisted_task_window_for_interactions_and_overlays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    beta_dir = tmp_path / "beta"
+    out_dir = tmp_path / "delta"
+    _write_delta_beta_artifacts(beta_dir)
+    _write_gamma_smpl_tracks(beta_dir)
+    (beta_dir / "task_window.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "0.1.0",
+                "video_id": "demo_0001",
+                "source": "cli_override",
+                "start_frame_idx": 2,
+                "end_frame_idx": 2,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    bundle = validate_bundle(load_bundle(bundle_root / "spec"))
+
+    monkeypatch.setattr(object_extract, "ensure_delta_dependencies", lambda grounded_sam2_root: tmp_path / "Grounded-SAM-2")
+    monkeypatch.setattr(
+        object_extract,
+        "probe_seed_frame_candidates",
+        lambda grounded_sam2_root, frame_candidates, prompts, device, work_dir: [
+            SeedFrameProbe(
+                frame_idx=frame_candidates[0].frame_idx,
+                frame_name=frame_candidates[0].frame_name,
+                segment=frame_candidates[0].segment,
+                detected_ontology_ids=("target_object", "receptacle", "tabletop"),
+                detection_scores={"target_object": 0.9, "receptacle": 0.85, "tabletop": 0.8},
+            )
+        ],
+    )
+    monkeypatch.setattr(object_extract, "run_grounded_sam2_tracking", lambda **_: _mock_tracking_payload())
+
+    summary = object_extract.extract_monocular_objects(
+        bundle=bundle,
+        beta_dir=beta_dir,
+        out_dir=out_dir,
+        grounded_sam2_root=tmp_path / "Grounded-SAM-2",
+    )
+
+    assert summary["task_window"]["start_frame_idx"] == 2
+    interaction_rows = pq.read_table(out_dir / "objects" / "interactions.parquet").to_pylist()
+    assert {row["frame_idx"] for row in interaction_rows} == {2}
+    overlay_names = {path.stem for path in (out_dir / "objects" / "overlays").iterdir()}
+    assert overlay_names == {"frame_000002"}
 
 
 def test_extract_monocular_objects_without_gamma_writes_null_wrist_fields(
