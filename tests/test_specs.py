@@ -34,6 +34,7 @@ def test_checked_in_bundle_validates(example_bundle_dicts: tuple[dict, dict, dic
     assert validated.robot.robot_id == "ur5e_robotiq_2f85"
     assert validated.task.family == "pick_place"
     assert validated.capture.scale_source == "fiducial"
+    assert validated.capture.beta.colmap.camera_model == "OPENCV"
 
 
 def test_missing_required_field_reports_targeted_error(
@@ -103,3 +104,14 @@ def test_task_regions_must_stay_inside_workspace(
 
     assert any(issue.field_path == "place_region.target_region_m" for issue in excinfo.value.issues)
 
+
+def test_beta_camera_model_is_rejected(example_bundle_dicts: tuple[dict, dict, dict], tmp_path: Path) -> None:
+    robot, task, capture = example_bundle_dicts
+    broken_capture = deepcopy(capture)
+    broken_capture["beta"]["colmap"]["camera_model"] = "PINHOLE"
+    _write_bundle(tmp_path, robot, task, broken_capture)
+
+    with pytest.raises(SpecValidationError) as excinfo:
+        validate_bundle(load_bundle(tmp_path))
+
+    assert any(issue.field_path == "beta.colmap.camera_model" for issue in excinfo.value.issues)

@@ -1,7 +1,6 @@
 # Video Task Compiler
 
-Phase alpha bootstraps the contract layer for a video-to-robot task compiler.
-The repository currently supports exactly one profile:
+The repository currently supports exactly one monocular tabletop profile:
 
 - Robot: `UR5e + Robotiq 2F-85`
 - Task family: `pick_place`
@@ -9,17 +8,19 @@ The repository currently supports exactly one profile:
 - Operator flow: `prompted_semi_automatic`
 - Metric scale recovery: `fiducial`
 
-Alpha does not perform video ingestion, reconstruction, MuJoCo scene generation,
-learning, or ROS 2 deployment yet. It defines and validates the configuration
-artifacts those later phases will depend on.
+Phase beta adds monocular video ingestion, timestamp export, COLMAP-based camera
+calibration, fiducial normalization, and dense per-frame camera pose export.
+The repository still does not perform scene understanding, MuJoCo scene
+generation, learning, or ROS 2 deployment.
 
 ## What is included
 
 - A Python package in `src/video_task_compiler/`
 - A `vtc` CLI with `spec init`, `spec validate`, and `spec schema`
+- A `vtc video ingest-monocular` beta pipeline command
 - Typed YAML models with cross-file compatibility validation
 - A checked-in example bundle in `spec/`
-- Tests covering the supported alpha profile and main failure modes
+- Tests covering the supported profile, validation rules, and beta pipeline logic
 
 ## Quick start
 
@@ -28,27 +29,37 @@ python -m pip install -e .[dev]
 vtc spec validate --spec-dir spec
 vtc spec schema --out-dir build/schemas
 vtc spec init --template ur5e_monocular_pick_place --output-dir ./example-spec
+vtc video ingest-monocular --spec-dir spec --video ./demo.mp4 --out-dir ./artifacts/run01
 ```
 
 ## Spec files
 
-The alpha contract is defined by three YAML files:
+The contract is still defined by three YAML files:
 
 - `spec/robot.yaml`
 - `spec/task.yaml`
 - `spec/capture.yaml`
 
-These files must be versioned together and validated as one bundle. File-local
-validation alone is not sufficient because the task, robot, and capture
-contracts share assumptions about embodiment, workspace, and capture geometry.
+These files must be versioned together and validated as one bundle. The capture
+contract now includes a required `beta` block for frame extraction, COLMAP, and
+normalization settings.
 
-## Out of scope for alpha
+## Beta outputs
+
+The monocular beta pipeline writes:
+
+- `frames/`
+- `timestamps.csv`
+- `camera_intrinsics.json`
+- `camera_poses.json`
+- `reprojection_preview.jpg`
+- `reconstruction_summary.json`
+
+## Out of scope
 
 - Video decoding and frame extraction
 - Human pose tracking
 - Object detection or segmentation
-- 3D reconstruction or mesh generation
 - MuJoCo MJCF compilation
 - Imitation learning or RL training
 - ROS 2 or hardware deployment
-

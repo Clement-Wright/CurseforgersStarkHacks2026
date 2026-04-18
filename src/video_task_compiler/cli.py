@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+from typing import Optional
 
 import typer
 from importlib.resources import files
@@ -14,10 +15,13 @@ from .specs import (
     load_bundle,
     validate_bundle,
 )
+from .video_ingest import VideoIngestError, ingest_monocular_video
 
 app = typer.Typer(help="Video Task Compiler utilities.")
 spec_app = typer.Typer(help="Manage alpha spec bundles.")
+video_app = typer.Typer(help="Run beta video ingest pipelines.")
 app.add_typer(spec_app, name="spec")
+app.add_typer(video_app, name="video")
 
 
 def _template_dir(template: str) -> Path:
@@ -110,10 +114,74 @@ def spec_schema(
     typer.echo(f"wrote {len(schemas)} schema files to {out_dir}")
 
 
+@video_app.command("ingest-monocular")
+def ingest_monocular(
+    spec_dir: Path = typer.Option(
+        ...,
+        "--spec-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Directory that contains the validated robot.yaml, task.yaml, and capture.yaml bundle.",
+    ),
+    video: Path = typer.Option(
+        ...,
+        "--video",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="Input monocular video file.",
+    ),
+    out_dir: Path = typer.Option(
+        ...,
+        "--out-dir",
+        file_okay=False,
+        dir_okay=True,
+        writable=True,
+        resolve_path=True,
+        help="Directory that will receive beta ingest artifacts.",
+    ),
+    colmap_bin: Optional[str] = typer.Option(
+        None,
+        "--colmap-bin",
+        help="Optional explicit path to the COLMAP executable.",
+    ),
+    keep_workdir: bool = typer.Option(
+        False,
+        "--keep-workdir",
+        help="Keep raw COLMAP work artifacts under the output directory.",
+    ),
+) -> None:
+    """Decode a monocular demo video, calibrate it with COLMAP, and export dense poses."""
+    try:
+        bundle = load_bundle(spec_dir)
+        validate_bundle(bundle)
+        if bundle.capture.modality != "rgb_monocular":
+            raise VideoIngestError("beta ingest-monocular only supports rgb_monocular capture bundles")
+        ingest_monocular_video(
+            bundle=bundle,
+            video_path=video,
+            out_dir=out_dir,
+            colmap_bin=colmap_bin,
+            keep_workdir=keep_workdir,
+        )
+    except SpecValidationError as exc:
+        _print_issues(exc)
+        raise typer.Exit(code=1) from exc
+    except VideoIngestError as exc:
+        typer.echo(f"video ingest failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"video ingest completed successfully in {out_dir}")
+
+
 def main() -> None:
     app()
 
 
 if __name__ == "__main__":
     main()
-

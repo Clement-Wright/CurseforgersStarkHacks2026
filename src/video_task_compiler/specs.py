@@ -196,6 +196,38 @@ class CaptureConstraintsSpec(BaseModel):
     lock_exposure_if_possible: bool
 
 
+class FrameExtractionConfigSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    image_format: Literal["png"]
+    keyframe_sample_fps: float = Field(gt=0.0)
+
+
+class ColmapConfigSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    camera_model: Literal["OPENCV"]
+    matcher: Literal["sequential"]
+    min_registered_keyframes: int = Field(ge=1)
+    min_registered_ratio: float = Field(ge=0.0, le=1.0)
+    max_mean_reprojection_error_px: float = Field(gt=0.0)
+    max_interpolation_gap_s: float = Field(gt=0.0)
+
+
+class NormalizationConfigSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    world_frame: Literal["fiducial_center"]
+
+
+class BetaCaptureSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    frame_extraction: FrameExtractionConfigSpec
+    colmap: ColmapConfigSpec
+    normalization: NormalizationConfigSpec
+
+
 class CaptureSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -209,6 +241,7 @@ class CaptureSpec(BaseModel):
     scale_source: Literal["fiducial"]
     fiducial: FiducialSpec
     constraints: CaptureConstraintsSpec
+    beta: BetaCaptureSpec
 
 
 class SpecBundle(BaseModel):
@@ -371,6 +404,42 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
             )
         )
 
+    if bundle.capture.beta.frame_extraction.image_format != "png":
+        issues.append(
+            _compat_issue(
+                bundle.capture_path,
+                "beta.frame_extraction.image_format",
+                "beta frame extraction must emit png images",
+            )
+        )
+
+    if bundle.capture.beta.colmap.camera_model != "OPENCV":
+        issues.append(
+            _compat_issue(
+                bundle.capture_path,
+                "beta.colmap.camera_model",
+                "beta currently supports only the OPENCV COLMAP camera model",
+            )
+        )
+
+    if bundle.capture.beta.colmap.matcher != "sequential":
+        issues.append(
+            _compat_issue(
+                bundle.capture_path,
+                "beta.colmap.matcher",
+                "beta currently supports only the sequential COLMAP matcher",
+            )
+        )
+
+    if bundle.capture.beta.normalization.world_frame != "fiducial_center":
+        issues.append(
+            _compat_issue(
+                bundle.capture_path,
+                "beta.normalization.world_frame",
+                "beta normalization must use the fiducial_center world frame",
+            )
+        )
+
     if issues:
         raise SpecValidationError(issues)
 
@@ -383,4 +452,3 @@ def emit_json_schemas() -> dict[str, dict[str, Any]]:
         "task.schema.json": TaskSpec.model_json_schema(),
         "capture.schema.json": CaptureSpec.model_json_schema(),
     }
-
