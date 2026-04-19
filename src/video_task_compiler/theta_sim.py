@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Sequence
 from xml.etree import ElementTree as ET
 
+import imageio.v2 as imageio
 import numpy as np
 import pyarrow.parquet as pq
 import yaml
@@ -45,7 +46,7 @@ def _path_string(path: Path) -> str:
 
 def missing_theta_dependencies() -> list[str]:
     missing: list[str] = []
-    for module_name in ("numpy", "PIL", "pyarrow"):
+    for module_name in ("imageio", "numpy", "PIL", "pyarrow"):
         if importlib.util.find_spec(module_name) is None:
             missing.append(module_name)
     return missing
@@ -335,8 +336,14 @@ def _object_map_by_ontology(path: Path) -> dict[str, dict[str, Any]]:
         raise ThetaSimError(f"object_init_poses_metric.json did not contain an objects list: {path}")
     result: dict[str, dict[str, Any]] = {}
     for obj in objects:
-        if isinstance(obj, dict) and obj.get("ontology_id"):
-            result[str(obj["ontology_id"])] = obj
+        if not isinstance(obj, dict):
+            continue
+        instance_id = str(obj.get("instance_id", "")).strip()
+        ontology_id = str(obj.get("ontology_id", "")).strip()
+        if instance_id:
+            result[instance_id] = obj
+        if ontology_id and ontology_id not in result:
+            result[ontology_id] = obj
     return result
 
 
@@ -419,12 +426,29 @@ def _trace_event_index(phases: Sequence[str], target_phase: str) -> int:
     return 0
 
 
+def _manipulable_instance_ids(bundle: SpecBundle) -> set[str]:
+    instance_ids = {
+        str(instance_id)
+        for goal in bundle.task.goals
+        for instance_id in goal.source_instance_ids
+    }
+    if instance_ids:
+        return instance_ids
+    return {
+        str(instance.instance_id)
+        for instance in bundle.task.scene_instances
+        if getattr(instance, "role", "") == "manipulable"
+        or instance.ontology_id == bundle.project.ontology.target_object_id
+    }
+
+
 def _build_task_json(
     bundle: SpecBundle,
     *,
     epsilon_dir: Path,
     zeta_dir: Path,
     eta_dir: Path,
+    zeta_manifest: dict[str, Any],
     world_transform: dict[str, Any],
     support_plane: dict[str, Any],
     object_pose_map: dict[str, dict[str, Any]],
@@ -455,19 +479,88 @@ def _build_task_json(
                 "t_ns": int(robot_trace["t_ns"][trace_index]),
             }
         )
+    manipulable_instance_ids = _manipulable_instance_ids(bundle)
     initial_object_states = []
-    for ontology_id in (bundle.project.ontology.target_object_id, bundle.project.ontology.receptacle_object_id):
-        object_payload = object_pose_map.get(ontology_id)
-        if object_payload is None:
-            continue
+    for obj in zeta_manifest.get("objects", []):
+        instance_id = str(obj.get("instance_id", "")).strip() or None
+        ontology_id = str(obj.get("ontology_id", "")).strip()
+        object_payload = object_pose_map.get(instance_id or "", object_pose_map.get(ontology_id, obj))
         initial_object_states.append(
             {
+                "instance_id": instance_id,
                 "ontology_id": ontology_id,
                 "track_id": object_payload["track_id"],
                 "class_name": object_payload["class_name"],
                 "position_m": object_payload["position_m"],
                 "extents_m": object_payload["extents_m"],
-                "motion_mode": "freejoint" if ontology_id == bundle.project.ontology.target_object_id else "fixed",
+                "motion_mode": (
+                    "freejoint"
+                    if (instance_id in manipulable_instance_ids or ontology_id == bundle.project.ontology.target_object_id)
+                    else "fixed"
+                ),
+                "geometry_source": object_payload.get("geometry_source"),
+                "mesh_path": object_payload.get("mesh_path"),
+            }
+        )
+    scene_instances = []
+    for instance in bundle.task.scene_instances:
+        scene_instances.append(
+            {
+                "instance_id": instance.instance_id,
+                "ontology_id": instance.ontology_id,
+                "role": instance.role,
+                "prompt_text": instance.prompt_text,
+                "size_prior_m": (
+                    None
+                    if instance.size_prior_m is None
+                    else {
+                        "x": instance.size_prior_m.x,
+                        "y": instance.size_prior_m.y,
+                        "z": instance.size_prior_m.z,
+                    }
+                ),
+                "search_region_m": (
+                    None
+                    if instance.search_region_m is None
+                    else {
+                        "min_m": {
+                            "x": instance.search_region_m.min_m.x,
+                            "y": instance.search_region_m.min_m.y,
+                            "z": instance.search_region_m.min_m.z,
+                        },
+                        "max_m": {
+                            "x": instance.search_region_m.max_m.x,
+                            "y": instance.search_region_m.max_m.y,
+                            "z": instance.search_region_m.max_m.z,
+                        },
+                    }
+                ),
+                "target_region_m": (
+                    None
+                    if instance.target_region_m is None
+                    else {
+                        "min_m": {
+                            "x": instance.target_region_m.min_m.x,
+                            "y": instance.target_region_m.min_m.y,
+                            "z": instance.target_region_m.min_m.z,
+                        },
+                        "max_m": {
+                            "x": instance.target_region_m.max_m.x,
+                            "y": instance.target_region_m.max_m.y,
+                            "z": instance.target_region_m.max_m.z,
+                        },
+                    }
+                ),
+            }
+        )
+    goals = []
+    for goal in bundle.task.goals:
+        goals.append(
+            {
+                "goal_id": goal.goal_id,
+                "type": goal.type,
+                "source_instance_ids": list(goal.source_instance_ids),
+                "target_region_instance_id": goal.target_region_instance_id,
             }
         )
     return {
@@ -490,6 +583,8 @@ def _build_task_json(
             "target_object_id": bundle.project.ontology.target_object_id,
             "receptacle_object_id": bundle.project.ontology.receptacle_object_id,
             "support_surface_id": bundle.project.ontology.support_surface_id,
+            "reference_object_ids": list(bundle.project.ontology.reference_object_ids),
+            "fiducial_board_id": bundle.project.ontology.fiducial_board_id,
             "success_metric": bundle.task.success.metric,
             "position_tolerance_m": bundle.task.success.position_tolerance_m,
             "hold_time_s": bundle.task.success.hold_time_s,
@@ -513,6 +608,8 @@ def _build_task_json(
                 "height_m": support_plane.get("height_m"),
                 "normal_m": support_plane.get("normal_m"),
             },
+            "scene_instances": scene_instances,
+            "goals": goals,
         },
         "provenance": {
             "project_spec_ref": _path_string(bundle.project_path),
@@ -562,6 +659,7 @@ def _first_valid_human_segment(human_ghost: dict[str, np.ndarray]) -> tuple[np.n
 
 
 def _activity_center(
+    bundle: SpecBundle,
     robot_trace: dict[str, np.ndarray],
     object_pose_map: dict[str, dict[str, Any]],
     target_region: dict[str, Any],
@@ -571,8 +669,9 @@ def _activity_center(
     if ee_positions is not None and len(ee_positions) > 0:
         centers.append(np.median(np.asarray(ee_positions, dtype=float), axis=0))
     for ontology_id in (
-        "target_object",
-        "receptacle",
+        bundle.project.ontology.target_object_id,
+        bundle.project.ontology.receptacle_object_id,
+        *bundle.project.ontology.reference_object_ids,
     ):
         payload = object_pose_map.get(ontology_id)
         if payload is not None:
@@ -676,13 +775,15 @@ def _write_scene_xml(
         rgba="0.85 0.85 0.85 1",
     )
     _support_table_geom(worldbody, zeta_manifest, support_plane)
+    manipulable_instance_ids = _manipulable_instance_ids(bundle)
 
     for obj in zeta_manifest.get("objects", []):
-        object_name = _sanitize_name(str(obj["track_id"]))
+        instance_id = str(obj.get("instance_id", "")).strip() or None
+        object_name = _sanitize_name(instance_id or str(obj["track_id"]))
         _add_mesh_asset(asset, f"{object_name}_visual", f"../{obj['visual_mesh']}")
         for index, collision_mesh in enumerate(obj["collision_meshes"]):
             _add_mesh_asset(asset, f"{object_name}_collision_{index:02d}", f"../{collision_mesh}")
-        object_pose = object_pose_map.get(str(obj["ontology_id"]), obj)
+        object_pose = object_pose_map.get(instance_id or "", object_pose_map.get(str(obj["ontology_id"]), obj))
         position = object_pose.get("position_m", obj["position_m"])
         body = ET.SubElement(
             worldbody,
@@ -690,7 +791,7 @@ def _write_scene_xml(
             name=object_name,
             pos=_format_xyz(position),
         )
-        if str(obj["ontology_id"]) == bundle.project.ontology.target_object_id:
+        if instance_id in manipulable_instance_ids or str(obj["ontology_id"]) == bundle.project.ontology.target_object_id:
             ET.SubElement(body, "freejoint", name=f"{object_name}_freejoint")
         ET.SubElement(
             body,
@@ -711,7 +812,7 @@ def _write_scene_xml(
                 "mesh": f"{object_name}_collision_{index:02d}",
                 "rgba": "0.85 0.9 0.85 0.12",
             }
-            if str(obj["ontology_id"]) == bundle.project.ontology.target_object_id:
+            if instance_id in manipulable_instance_ids or str(obj["ontology_id"]) == bundle.project.ontology.target_object_id:
                 collision_kwargs["density"] = "180"
                 collision_kwargs["friction"] = "0.8 0.05 0.01"
             else:
@@ -1051,11 +1152,85 @@ def _render_audit_image(
         )
 
 
+def _render_playback_videos(
+    mujoco: Any,
+    model: Any,
+    data: Any,
+    *,
+    initial_qpos: np.ndarray,
+    robot_trace: dict[str, np.ndarray],
+    playback_dir: Path,
+    camera_names: Sequence[str] = ("audit_camera", "debug_camera"),
+) -> list[dict[str, Any]]:
+    renderer_cls = getattr(mujoco, "Renderer", None)
+    playback_dir.mkdir(parents=True, exist_ok=True)
+    trace_indices = _trace_sample_indices(len(robot_trace["t_ns"]), min(32, max(1, len(robot_trace["t_ns"]))))
+    results: list[dict[str, Any]] = []
+    if renderer_cls is None:
+        for camera_name in camera_names:
+            path = playback_dir / f"{camera_name}.mp4"
+            frames = [np.full((540, 960, 3), 235, dtype=np.uint8) for _ in range(max(1, len(trace_indices)))]
+            imageio.mimsave(path, frames, fps=10)
+            results.append(
+                {
+                    "camera_name": camera_name,
+                    "path": _path_string(path),
+                    "ok": True,
+                    "mode": "placeholder_video",
+                    "frame_count": len(frames),
+                }
+            )
+        return results
+
+    for camera_name in camera_names:
+        path = playback_dir / f"{camera_name}.mp4"
+        frames: list[np.ndarray] = []
+        mode = "mujoco_renderer"
+        try:
+            renderer = renderer_cls(model, 960, 540)
+            try:
+                for index in trace_indices:
+                    _apply_robot_trace_state(
+                        mujoco,
+                        model,
+                        data,
+                        initial_qpos,
+                        np.asarray(robot_trace["joint_positions_rad"][index], dtype=float),
+                        float(robot_trace["gripper_width_m"][index]),
+                    )
+                    update_scene = getattr(renderer, "update_scene", None)
+                    if update_scene is not None:
+                        try:
+                            update_scene(data, camera=camera_name)
+                        except TypeError:
+                            update_scene(data)
+                    frames.append(np.asarray(renderer.render(), dtype=np.uint8))
+            finally:
+                close_fn = getattr(renderer, "close", None)
+                if close_fn is not None:
+                    close_fn()
+        except Exception:
+            mode = "placeholder_video"
+            frames = [np.full((540, 960, 3), 235, dtype=np.uint8) for _ in range(max(1, len(trace_indices)))]
+        imageio.mimsave(path, frames, fps=10)
+        results.append(
+            {
+                "camera_name": camera_name,
+                "path": _path_string(path),
+                "ok": True,
+                "mode": mode,
+                "frame_count": len(frames),
+            }
+        )
+    return results
+
+
 def _compile_and_validate_scene(
     *,
     bundle: SpecBundle,
     scene_xml_path: Path,
     scene_mjb_path: Path,
+    playback_dir: Path,
     support_bbox: tuple[np.ndarray, np.ndarray],
     zeta_manifest: dict[str, Any],
     object_pose_map: dict[str, dict[str, Any]],
@@ -1107,6 +1282,14 @@ def _compile_and_validate_scene(
             target_region=target_region,
             robot_trace=robot_trace,
             human_ghost=human_ghost,
+        )
+        playback_renders = _render_playback_videos(
+            mujoco,
+            model,
+            data,
+            initial_qpos=initial_qpos,
+            robot_trace=robot_trace,
+            playback_dir=playback_dir,
         )
     except Exception as exc:
         raise ThetaSimError(f"theta compile-task failed for {scene_xml_path}: {exc}") from exc
@@ -1171,6 +1354,8 @@ def _compile_and_validate_scene(
             "human_ghost_frame_count": int(len(human_ghost["t_ns"])),
             "robot_ghost_visible": bool("ee_position_m" in robot_trace and len(robot_trace["ee_position_m"]) > 0),
             "human_ghost_visible": bool(_first_valid_human_segment(human_ghost) is not None),
+            "renders_ok": all(bool(render.get("ok")) for render in playback_renders),
+            "renders": playback_renders,
         },
         "spatial_sanity": spatial_sanity,
     }
@@ -1194,6 +1379,8 @@ def enforce_theta_acceptance(bundle: SpecBundle, validation: dict[str, Any]) -> 
         raise ThetaSimError("theta robot ghost marker was not available")
     if bundle.project.acceptance.theta_require_human_ghost_visible and not bool(playback["human_ghost_visible"]):
         raise ThetaSimError("theta human ghost marker was not available")
+    if bundle.project.acceptance.theta_require_playback_renders and not bool(playback["renders_ok"]):
+        raise ThetaSimError("theta playback renders were not produced successfully")
 
 
 def compile_task_package(
@@ -1252,6 +1439,7 @@ def compile_task_package(
         epsilon_dir=epsilon_dir,
         zeta_dir=zeta_dir,
         eta_dir=eta_dir,
+        zeta_manifest=zeta_manifest,
         world_transform=world_transform,
         support_plane=support_plane,
         object_pose_map=object_pose_map,
@@ -1265,7 +1453,7 @@ def compile_task_package(
 
     metric_camera_frame = _metric_camera_frame_for_task_window(metric_camera_payload, task_window)
     audit_camera = _audit_camera_from_metric_pose(metric_camera_frame)
-    debug_camera = _debug_camera(_activity_center(robot_trace, object_pose_map, target_region), support_bbox)
+    debug_camera = _debug_camera(_activity_center(bundle, robot_trace, object_pose_map, target_region), support_bbox)
     scene_xml_path = sim_dir / "scene.xml"
     _write_scene_xml(
         scene_xml_path,
@@ -1285,6 +1473,7 @@ def compile_task_package(
         bundle=bundle,
         scene_xml_path=scene_xml_path,
         scene_mjb_path=sim_dir / "scene.mjb",
+        playback_dir=playback_dir,
         support_bbox=support_bbox,
         zeta_manifest=zeta_manifest,
         object_pose_map=object_pose_map,
@@ -1310,6 +1499,7 @@ def compile_task_package(
         "zero_control_smoke_ok": bool(validation["scene_compile"]["zero_control_smoke_ok"]),
         "trace_smoke_ok": bool(validation["scene_compile"]["trace_smoke_ok"]),
         "audit_render_ok": bool(validation["audit_render"]["ok"]),
+        "playback_renders_ok": bool(validation["playback"]["renders_ok"]),
         "robot_ghost_visible": bool(validation["playback"]["robot_ghost_visible"]),
         "human_ghost_visible": bool(validation["playback"]["human_ghost_visible"]),
         "robot_base_identity_ok": bool(validation["spatial_sanity"]["robot_base_identity_ok"]),

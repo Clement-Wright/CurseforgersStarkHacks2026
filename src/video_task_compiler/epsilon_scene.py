@@ -34,6 +34,7 @@ class DependencyError(EpsilonSceneError):
 @dataclass(frozen=True)
 class ObjectGeometryEstimate:
     track_id: str
+    instance_id: str | None
     ontology_id: str
     class_name: str
     object_frame: str
@@ -45,6 +46,8 @@ class ObjectGeometryEstimate:
     footprint_estimator: str
     height_mode: str
     raw_planar_extent_stats_m: dict[str, Any]
+    geometry_source: str
+    mesh_path: str | None
 
 
 def _path_string(path: Path) -> str:
@@ -344,6 +347,31 @@ def _default_object_extent_xy(bundle: SpecBundle, ontology_id: str) -> np.ndarra
     return np.array([default_side, default_side], dtype=float)
 
 
+def _scene_instance_for_track(bundle: SpecBundle, track: dict[str, Any]) -> Any | None:
+    instance_id = str(track.get("instance_id", "")).strip()
+    ontology_id = str(track.get("ontology_id", track.get("class_name", ""))).strip()
+    if instance_id:
+        for instance in bundle.task.scene_instances:
+            if instance.instance_id == instance_id:
+                return instance
+    for instance in bundle.task.scene_instances:
+        if instance.ontology_id == ontology_id:
+            return instance
+    return None
+
+
+def _size_prior_extent_xy(scene_instance: Any | None) -> np.ndarray | None:
+    if scene_instance is None or scene_instance.size_prior_m is None:
+        return None
+    return np.array(
+        [
+            float(scene_instance.size_prior_m.x),
+            float(scene_instance.size_prior_m.y),
+        ],
+        dtype=float,
+    )
+
+
 def _support_height_m(bundle: SpecBundle) -> float:
     return min(
         float(bundle.task.pick_object.search_region_m.min_m.z),
@@ -378,6 +406,12 @@ def _estimate_object_geometries(
             continue
         if ontology_kind.get(ontology_id, "object") != "object":
             continue
+        scene_instance = _scene_instance_for_track(bundle, track)
+        instance_id = (
+            str(scene_instance.instance_id)
+            if scene_instance is not None
+            else (str(track.get("instance_id", "")).strip() or None)
+        )
 
         centers_xy: list[np.ndarray] = []
         extents_xy: list[np.ndarray] = []
@@ -445,7 +479,8 @@ def _estimate_object_geometries(
         if extents_xy:
             extent_xy = np.asarray(extent_stats["p35_xy"], dtype=float)
         else:
-            extent_xy = _default_object_extent_xy(bundle, ontology_id)
+            size_prior_xy = _size_prior_extent_xy(scene_instance)
+            extent_xy = size_prior_xy if size_prior_xy is not None else _default_object_extent_xy(bundle, ontology_id)
         extent_xy = np.clip(extent_xy, 0.015, 0.25)
 
         height_m = float(bundle.project.epsilon.default_object_height_m)
@@ -456,9 +491,10 @@ def _estimate_object_geometries(
         estimates.append(
             ObjectGeometryEstimate(
                 track_id=str(track.get("track_id", ontology_id)),
+                instance_id=instance_id,
                 ontology_id=ontology_id,
                 class_name=str(track.get("class_name", ontology_id)),
-                object_frame=f"O_{_sanitize_name(ontology_id)}",
+                object_frame=f"O_{_sanitize_name(instance_id or ontology_id)}",
                 position_m=position_m,
                 extents_m=np.array([float(extent_xy[0]), float(extent_xy[1]), height_m], dtype=float),
                 observed_frame_idx=observed_frame_idx,
@@ -467,6 +503,10 @@ def _estimate_object_geometries(
                 footprint_estimator="support_plane_mask_obb",
                 height_mode="proxy_default_height",
                 raw_planar_extent_stats_m=extent_stats,
+                geometry_source="mask_backprojected_cuboid"
+                if extents_xy
+                else ("scene_instance_size_prior_cuboid" if scene_instance is not None and scene_instance.size_prior_m is not None else "default_proxy_cuboid"),
+                mesh_path=None,
             )
         )
     return estimates
@@ -771,10 +811,10 @@ def compile_metric_scene(
     out_dir: Path,
 ) -> dict[str, Any]:
     ensure_epsilon_dependencies()
-    if bundle.project.epsilon.geometry_mode != "proxy_scene":
+    if bundle.project.epsilon.geometry_mode not in {"proxy_scene", "dense_static_reconstruction"}:
         raise EpsilonSceneError(
             f"epsilon geometry_mode '{bundle.project.epsilon.geometry_mode}' is not implemented yet; "
-            "the current MVP supports only proxy_scene"
+            "the current MVP supports proxy_scene and dense_static_reconstruction"
         )
     if bundle.project.epsilon.metric_alignment_mode != "inherited_from_beta":
         raise EpsilonSceneError(
@@ -807,8 +847,9 @@ def compile_metric_scene(
     scene_dir = out_dir / "scene"
     dense_dir = scene_dir / "static_dense"
     object_clouds_dir = scene_dir / "object_clouds"
+    object_meshes_dir = scene_dir / "object_meshes"
     qc_dir = scene_dir / "qc"
-    for path in (camera_dir, scene_dir, dense_dir, object_clouds_dir, qc_dir):
+    for path in (camera_dir, scene_dir, dense_dir, object_clouds_dir, object_meshes_dir, qc_dir):
         path.mkdir(parents=True, exist_ok=True)
     persist_task_window(task_window, out_dir, video_id=bundle.project.video_id)
 
@@ -846,15 +887,19 @@ def compile_metric_scene(
         track_name = _sanitize_name(estimate.track_id)
         point_cloud = _box_surface_points(estimate.position_m, estimate.extents_m)
         _write_point_cloud_ply(object_clouds_dir / f"{track_name}.ply", point_cloud, (255, 128, 64))
+        local_vertices, local_faces = _box_vertices_faces(np.zeros(3, dtype=float), estimate.extents_m)
+        mesh_path = object_meshes_dir / f"{track_name}.obj"
+        _write_obj_mesh(mesh_path, local_vertices, local_faces)
         T_MO = np.eye(4, dtype=float)
         T_MO[:3, 3] = estimate.position_m
         object_payload["objects"].append(
             {
                 "track_id": estimate.track_id,
+                "instance_id": estimate.instance_id,
                 "ontology_id": estimate.ontology_id,
                 "class_name": estimate.class_name,
                 "object_frame": estimate.object_frame,
-                "geometry_source": "proxy_box_surface",
+                "geometry_source": estimate.geometry_source,
                 "measured": False,
                 "footprint_estimator": estimate.footprint_estimator,
                 "height_mode": estimate.height_mode,
@@ -867,6 +912,7 @@ def compile_metric_scene(
                 "raw_planar_extent_stats_m": estimate.raw_planar_extent_stats_m,
                 "T_MO": T_MO.tolist(),
                 "point_cloud_path": f"scene/object_clouds/{track_name}.ply",
+                "mesh_path": f"scene/object_meshes/{track_name}.obj",
             }
         )
 
@@ -905,12 +951,13 @@ def compile_metric_scene(
         "world_frame": bundle.project.epsilon.metric_world_frame,
         "units": "meters",
         "geometry_mode": bundle.project.epsilon.geometry_mode,
-        "derived_from_dense_reconstruction": False,
-        "geometry_source": "task_regions_plus_mask_projection",
+        "derived_from_dense_reconstruction": bundle.project.epsilon.geometry_mode == "dense_static_reconstruction",
+        "geometry_source": "static_subset_plus_mask_projection",
         "source": {
             "beta_dir": _path_string(beta_dir),
             "delta_dir": _path_string(delta_dir),
             "camera_poses_metric": "camera/camera_poses_metric.json",
+            "static_geometry_subset": "scene/static_geometry_subset.json",
         },
         "sim3_M_from_W_ref": "scene/world_metric_from_world.json",
         "support_plane_ref": "scene/support_plane.json",

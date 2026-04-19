@@ -8,6 +8,7 @@ dependencies:
   - pyarrow
   - pyyaml
   - pillow
+  - imageio
   - typer
   - pip:
       - mujoco

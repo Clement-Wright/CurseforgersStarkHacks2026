@@ -1,32 +1,169 @@
 api_version: video-task-compiler/v1alpha1
-task_id: alpha_pick_place_demo
+task_id: alpha_tabletop_stacking_demo
 robot_id: ur5e_robotiq_2f85
-family: pick_place
-language_prompt: Pick up the red cube and place it into the black tray.
+family: tabletop_stacking
+language_prompt: Stack the white erasers onto the toothpaste boxes on the tabletop.
 pick_object:
-  ontology_id: target_object
-  text_prompt: red cube
+  ontology_id: eraser
+  text_prompt: white eraser
   search_region_m:
     min_m:
-      x: 0.32
-      y: -0.18
+      x: 0.30
+      y: -0.05
       z: 0.02
     max_m:
-      x: 0.58
-      y: 0.12
-      z: 0.22
-place_region:
-  ontology_id: receptacle
-  text_prompt: black tray center
-  target_region_m:
-    min_m:
-      x: 0.55
-      y: 0.08
-      z: 0.02
-    max_m:
-      x: 0.72
+      x: 0.70
       y: 0.28
       z: 0.12
+place_region:
+  ontology_id: stack_zone
+  text_prompt: stack zone on the toothpaste boxes
+  target_region_m:
+    min_m:
+      x: 0.38
+      y: -0.22
+      z: 0.02
+    max_m:
+      x: 0.64
+      y: 0.08
+      z: 0.16
+scene_instances:
+  - instance_id: tabletop_01
+    ontology_id: tabletop
+    role: support
+    prompt_text: tabletop
+    search_region_m:
+      min_m:
+        x: 0.25
+        y: -0.45
+        z: 0.02
+      max_m:
+        x: 0.85
+        y: 0.45
+        z: 0.08
+  - instance_id: fiducial_board_01
+    ontology_id: fiducial_board
+    role: fiducial
+    prompt_text: fiducial marker sheet
+    search_region_m:
+      min_m:
+        x: 0.62
+        y: -0.30
+        z: 0.02
+      max_m:
+        x: 0.82
+        y: 0.30
+        z: 0.08
+    size_prior_m:
+      x: 0.21
+      y: 0.15
+      z: 0.002
+  - instance_id: toothpaste_box_01
+    ontology_id: toothpaste_box
+    role: reference
+    prompt_text: toothpaste box
+    search_region_m:
+      min_m:
+        x: 0.33
+        y: -0.22
+        z: 0.02
+      max_m:
+        x: 0.58
+        y: -0.02
+        z: 0.12
+    size_prior_m:
+      x: 0.18
+      y: 0.04
+      z: 0.035
+  - instance_id: toothpaste_box_02
+    ontology_id: toothpaste_box
+    role: reference
+    prompt_text: toothpaste box
+    search_region_m:
+      min_m:
+        x: 0.33
+        y: 0.00
+        z: 0.02
+      max_m:
+        x: 0.58
+        y: 0.20
+        z: 0.12
+    size_prior_m:
+      x: 0.18
+      y: 0.04
+      z: 0.035
+  - instance_id: eraser_01
+    ontology_id: eraser
+    role: manipulable
+    prompt_text: white eraser
+    search_region_m:
+      min_m:
+        x: 0.44
+        y: 0.08
+        z: 0.02
+      max_m:
+        x: 0.72
+        y: 0.28
+        z: 0.10
+    size_prior_m:
+      x: 0.05
+      y: 0.02
+      z: 0.015
+  - instance_id: eraser_02
+    ontology_id: eraser
+    role: manipulable
+    prompt_text: white eraser
+    search_region_m:
+      min_m:
+        x: 0.44
+        y: 0.00
+        z: 0.02
+      max_m:
+        x: 0.72
+        y: 0.18
+        z: 0.10
+    size_prior_m:
+      x: 0.05
+      y: 0.02
+      z: 0.015
+  - instance_id: eraser_03
+    ontology_id: eraser
+    role: manipulable
+    prompt_text: white eraser
+    search_region_m:
+      min_m:
+        x: 0.50
+        y: -0.10
+        z: 0.02
+      max_m:
+        x: 0.78
+        y: 0.12
+        z: 0.10
+    size_prior_m:
+      x: 0.05
+      y: 0.02
+      z: 0.015
+  - instance_id: stack_zone_01
+    ontology_id: stack_zone
+    role: zone
+    prompt_text: stack zone
+    target_region_m:
+      min_m:
+        x: 0.40
+        y: -0.18
+        z: 0.04
+      max_m:
+        x: 0.62
+        y: 0.02
+        z: 0.16
+goals:
+  - goal_id: stack_white_erasers
+    type: place_instances_in_region
+    source_instance_ids:
+      - eraser_01
+      - eraser_02
+      - eraser_03
+    target_region_instance_id: stack_zone_01
 success:
   metric: object_in_target_region
   position_tolerance_m: 0.03

@@ -31,13 +31,24 @@ def test_checked_in_bundle_validates() -> None:
     assert bundle.project.gamma.primary_backbone == "fourdhumans"
     assert bundle.project.delta.primary_backbone == "grounded_sam2"
     assert bundle.project.epsilon.primary_backbone == "artifact_fusion"
-    assert bundle.project.epsilon.geometry_mode == "proxy_scene"
+    assert bundle.project.delta.track_scope == "instance_aware"
+    assert bundle.project.epsilon.geometry_mode == "dense_static_reconstruction"
     assert bundle.project.zeta.primary_backbone == "mujoco_safe_assets"
-    assert bundle.project.zeta.asset_mode == "proxy_visual_and_collision"
+    assert bundle.project.zeta.asset_mode == "geometry_backed_assets"
     assert bundle.project.eta.primary_backbone == "arm_gripper_waypoint_replay"
     assert bundle.project.eta.ik_backend == "pinocchio_seed"
+    assert bundle.project.eta.retarget_mode == "measured_world_replay"
     assert bundle.project.theta.primary_backbone == "canonical_mujoco_task"
-    assert bundle.task.pick_object.ontology_id == "target_object"
+    assert bundle.project.acceptance.theta_require_playback_renders is True
+    assert bundle.project.ontology.target_object_id == "eraser"
+    assert bundle.project.ontology.receptacle_object_id == "toothpaste_box"
+    assert bundle.project.ontology.fiducial_board_id == "fiducial_board"
+    assert bundle.task.family == "tabletop_stacking"
+    assert bundle.task.pick_object.ontology_id == "eraser"
+    assert bundle.task.place_region.ontology_id == "stack_zone"
+    assert len(bundle.task.scene_instances) >= 5
+    assert any(instance.instance_id == "eraser_01" for instance in bundle.task.scene_instances)
+    assert any(goal.goal_id == "stack_white_erasers" for goal in bundle.task.goals)
     assert bundle.capture.beta.normalization.world_frame == "fiducial_center"
     assert bundle.env_specs["sfm"].name == "video-task-compiler-sfm"
     assert bundle.env_specs["scene"].name == "video-task-compiler-scene"
@@ -238,3 +249,16 @@ def test_task_regions_must_stay_inside_workspace(tmp_path: Path) -> None:
         validate_bundle(load_bundle(bundle_root))
 
     assert any(issue.field_path == "place_region.target_region_m" for issue in excinfo.value.issues)
+
+
+def test_goal_target_region_instance_must_exist(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    task_path = bundle_root / "spec" / "task.yaml"
+    task_data = deepcopy(_load_yaml(task_path))
+    task_data["goals"][0]["target_region_instance_id"] = "missing_region"
+    _write_yaml(task_path, task_data)
+
+    with pytest.raises(SpecValidationError) as excinfo:
+        validate_bundle(load_bundle(bundle_root))
+
+    assert any("missing_region" in issue.reason for issue in excinfo.value.issues)

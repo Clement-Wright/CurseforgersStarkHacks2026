@@ -127,6 +127,27 @@ class PlaceRegionSpec(PromptedRegion):
     target_region_m: AABB
 
 
+class SceneInstanceSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    instance_id: str = Field(min_length=1)
+    ontology_id: str = Field(min_length=1)
+    prompt_text: str | None = None
+    role: Literal["manipulable", "reference", "support", "fiducial", "zone"] | None = None
+    search_region_m: AABB | None = None
+    target_region_m: AABB | None = None
+    size_prior_m: Vec3 | None = None
+
+
+class TaskGoalSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    goal_id: str = Field(min_length=1)
+    type: Literal["place_instance_in_region", "place_instances_in_region"]
+    source_instance_ids: list[str] = Field(min_length=1)
+    target_region_instance_id: str = Field(min_length=1)
+
+
 class SuccessSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -155,10 +176,12 @@ class TaskSpec(BaseModel):
     api_version: Literal[API_VERSION]
     task_id: str = Field(min_length=1)
     robot_id: str = Field(min_length=1)
-    family: Literal["pick_place"]
+    family: Literal["pick_place", "tabletop_stacking"]
     language_prompt: str = Field(min_length=1)
     pick_object: PickObjectSpec
     place_region: PlaceRegionSpec
+    scene_instances: list[SceneInstanceSpec] = Field(default_factory=list)
+    goals: list[TaskGoalSpec] = Field(default_factory=list)
     success: SuccessSpec
     operator_assist: OperatorAssistSpec
     assistant: AssistantSpec | None = None
@@ -283,6 +306,8 @@ class ProjectOntologyRefsSpec(BaseModel):
     target_object_id: str = Field(min_length=1)
     receptacle_object_id: str = Field(min_length=1)
     support_surface_id: str = Field(min_length=1)
+    reference_object_ids: list[str] = Field(default_factory=list)
+    fiducial_board_id: str | None = None
 
 
 class ProjectAcceptanceSpec(BaseModel):
@@ -314,6 +339,7 @@ class ProjectAcceptanceSpec(BaseModel):
     theta_require_audit_render: bool
     theta_require_robot_ghost_visible: bool
     theta_require_human_ghost_visible: bool
+    theta_require_playback_renders: bool = False
 
 
 class ProjectGammaSmoothingSpec(BaseModel):
@@ -345,7 +371,7 @@ class ProjectDeltaSpec(BaseModel):
 
     primary_backbone: Literal["grounded_sam2"]
     annotation_frame_policy: Literal["best_preroll_then_active"]
-    track_scope: Literal["ontology_only"]
+    track_scope: Literal["ontology_only", "instance_aware"]
     overlay_sample_count: int = Field(ge=1)
     interaction: ProjectDeltaInteractionSpec
     mask_encoding: Literal["coco_rle"]
@@ -379,7 +405,7 @@ class ProjectEtaSpec(BaseModel):
 
     primary_backbone: Literal["arm_gripper_waypoint_replay"]
     execution_mode: Literal["arm_gripper_waypoint_replay"]
-    retarget_mode: Literal["planar_pick_place"]
+    retarget_mode: Literal["planar_pick_place", "measured_world_replay"]
     ik_backend: Literal["pinocchio_seed"]
     pregrasp_clearance_m: float = Field(gt=0.0)
     transport_clearance_m: float = Field(gt=0.0)
@@ -702,9 +728,13 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
             )
         )
 
-    if bundle.task.family != "pick_place":
+    if bundle.task.family not in {"pick_place", "tabletop_stacking"}:
         issues.append(
-            _compat_issue(bundle.task_path, "family", "alpha only supports the pick_place task family")
+            _compat_issue(
+                bundle.task_path,
+                "family",
+                "alpha only supports the pick_place and tabletop_stacking task families",
+            )
         )
 
     if bundle.capture.modality != "rgb_monocular":
@@ -757,6 +787,63 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
                 "place region must lie within robot.workspace_bounds_m",
             )
         )
+
+    scene_instance_ids = [instance.instance_id for instance in bundle.task.scene_instances]
+    if len(scene_instance_ids) != len(set(scene_instance_ids)):
+        issues.append(
+            _compat_issue(
+                bundle.task_path,
+                "scene_instances",
+                "scene instance ids must be unique",
+            )
+        )
+
+    scene_instance_lookup = {instance.instance_id: instance for instance in bundle.task.scene_instances}
+    for index, instance in enumerate(bundle.task.scene_instances):
+        entity = ontology_lookup.get(instance.ontology_id)
+        if entity is None:
+            issues.append(
+                _compat_issue(
+                    bundle.task_path,
+                    f"scene_instances.{index}.ontology_id",
+                    f"ontology id '{instance.ontology_id}' was not defined in ontology.yaml",
+                )
+            )
+        if instance.search_region_m is not None and not bundle.robot.workspace_bounds_m.contains(instance.search_region_m):
+            issues.append(
+                _compat_issue(
+                    bundle.task_path,
+                    f"scene_instances.{index}.search_region_m",
+                    "scene instance search region must lie within robot.workspace_bounds_m",
+                )
+            )
+        if instance.target_region_m is not None and not bundle.robot.workspace_bounds_m.contains(instance.target_region_m):
+            issues.append(
+                _compat_issue(
+                    bundle.task_path,
+                    f"scene_instances.{index}.target_region_m",
+                    "scene instance target region must lie within robot.workspace_bounds_m",
+                )
+            )
+
+    for index, goal in enumerate(bundle.task.goals):
+        for source_instance_id in goal.source_instance_ids:
+            if source_instance_id not in scene_instance_lookup:
+                issues.append(
+                    _compat_issue(
+                        bundle.task_path,
+                        f"goals.{index}.source_instance_ids",
+                        f"goal references unknown scene instance '{source_instance_id}'",
+                    )
+                )
+        if goal.target_region_instance_id not in scene_instance_lookup:
+            issues.append(
+                _compat_issue(
+                    bundle.task_path,
+                    f"goals.{index}.target_region_instance_id",
+                    f"goal references unknown scene instance '{goal.target_region_instance_id}'",
+                )
+            )
 
     if not bundle.capture.motion_protocol.fixed_zoom:
         issues.append(
@@ -821,14 +908,26 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
             )
         )
 
-    if bundle.project.ontology.receptacle_object_id != bundle.task.place_region.ontology_id:
-        issues.append(
-            _compat_issue(
-                bundle.project_path,
-                "ontology.receptacle_object_id",
-                "project ontology receptacle id must match task.place_region.ontology_id",
+    if bundle.task.family == "pick_place":
+        if bundle.project.ontology.receptacle_object_id != bundle.task.place_region.ontology_id:
+            issues.append(
+                _compat_issue(
+                    bundle.project_path,
+                    "ontology.receptacle_object_id",
+                    "pick_place projects must match project ontology receptacle id to task.place_region.ontology_id",
+                )
             )
-        )
+    elif bundle.task.family == "tabletop_stacking":
+        if bundle.project.ontology.receptacle_object_id not in {
+            instance.ontology_id for instance in bundle.task.scene_instances
+        }:
+            issues.append(
+                _compat_issue(
+                    bundle.project_path,
+                    "ontology.receptacle_object_id",
+                    "tabletop_stacking projects must declare the receptacle class in task.scene_instances",
+                )
+            )
 
     for field_path, entity_id, allowed_kinds in (
         ("ontology.target_object_id", bundle.project.ontology.target_object_id, {"object"}),
@@ -853,6 +952,44 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
                     bundle.ontology_path if field_path.startswith("ontology.") else bundle.task_path,
                     field_path,
                     f"ontology id '{entity_id}' must be one of kinds {sorted(allowed_kinds)}",
+                )
+            )
+
+    for index, reference_id in enumerate(bundle.project.ontology.reference_object_ids):
+        entity = ontology_lookup.get(reference_id)
+        if entity is None:
+            issues.append(
+                _compat_issue(
+                    bundle.project_path,
+                    f"ontology.reference_object_ids.{index}",
+                    f"ontology id '{reference_id}' was not defined in ontology.yaml",
+                )
+            )
+        elif entity.kind != "object":
+            issues.append(
+                _compat_issue(
+                    bundle.project_path,
+                    f"ontology.reference_object_ids.{index}",
+                    f"ontology id '{reference_id}' must be of kind object",
+                )
+            )
+
+    if bundle.project.ontology.fiducial_board_id is not None:
+        fiducial_entity = ontology_lookup.get(bundle.project.ontology.fiducial_board_id)
+        if fiducial_entity is None:
+            issues.append(
+                _compat_issue(
+                    bundle.project_path,
+                    "ontology.fiducial_board_id",
+                    f"ontology id '{bundle.project.ontology.fiducial_board_id}' was not defined in ontology.yaml",
+                )
+            )
+        elif fiducial_entity.kind != "object":
+            issues.append(
+                _compat_issue(
+                    bundle.project_path,
+                    "ontology.fiducial_board_id",
+                    "ontology.fiducial_board_id must refer to an object entity",
                 )
             )
 
@@ -983,12 +1120,12 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
             )
         )
 
-    if bundle.project.delta.track_scope != "ontology_only":
+    if bundle.project.delta.track_scope not in {"ontology_only", "instance_aware"}:
         issues.append(
             _compat_issue(
                 bundle.project_path,
                 "delta.track_scope",
-                "delta currently supports only ontology_only tracking scope",
+                "delta track_scope must be ontology_only or instance_aware",
             )
         )
 
@@ -1037,12 +1174,12 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
                 )
             )
     elif bundle.project.epsilon.geometry_mode == "dense_static_reconstruction":
-        if bundle.project.epsilon.metric_alignment_mode != "measured_sim3":
+        if bundle.project.epsilon.metric_alignment_mode not in {"inherited_from_beta", "measured_sim3"}:
             issues.append(
                 _compat_issue(
                     bundle.project_path,
                     "epsilon.metric_alignment_mode",
-                    "dense_static_reconstruction epsilon must use measured_sim3 metric alignment",
+                    "dense_static_reconstruction epsilon must use inherited_from_beta or measured_sim3 metric alignment",
                 )
             )
         if bundle.project.epsilon.support_plane_source != "geometry_fit":
@@ -1063,12 +1200,12 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
             )
         )
 
-    if bundle.project.zeta.asset_mode != "proxy_visual_and_collision":
+    if bundle.project.zeta.asset_mode not in {"proxy_visual_and_collision", "geometry_backed_assets"}:
         issues.append(
             _compat_issue(
                 bundle.project_path,
                 "zeta.asset_mode",
-                "zeta currently supports only proxy_visual_and_collision assetization",
+                "zeta asset_mode must be proxy_visual_and_collision or geometry_backed_assets",
             )
         )
 
@@ -1117,12 +1254,12 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
             )
         )
 
-    if bundle.project.eta.retarget_mode != "planar_pick_place":
+    if bundle.project.eta.retarget_mode not in {"planar_pick_place", "measured_world_replay"}:
         issues.append(
             _compat_issue(
                 bundle.project_path,
                 "eta.retarget_mode",
-                "eta currently supports only planar_pick_place retargeting",
+                "eta retarget_mode must be planar_pick_place or measured_world_replay",
             )
         )
 

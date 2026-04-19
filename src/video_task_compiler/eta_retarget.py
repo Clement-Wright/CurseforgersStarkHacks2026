@@ -118,7 +118,12 @@ def _load_object_pose_map(path: Path) -> dict[str, dict[str, Any]]:
     for obj in payload.get("objects", []):
         if not isinstance(obj, dict):
             continue
-        pose_map[str(obj["ontology_id"])] = obj
+        ontology_id = str(obj.get("ontology_id", "")).strip()
+        instance_id = str(obj.get("instance_id", "")).strip()
+        if instance_id:
+            pose_map[instance_id] = obj
+        if ontology_id and ontology_id not in pose_map:
+            pose_map[ontology_id] = obj
     return pose_map
 
 
@@ -678,6 +683,7 @@ def enforce_eta_acceptance(bundle: SpecBundle, summary: dict[str, Any]) -> None:
 
 def retarget_monocular_demonstration(
     bundle: SpecBundle,
+    beta_dir: Path | None,
     gamma_dir: Path,
     delta_dir: Path,
     epsilon_dir: Path,
@@ -704,7 +710,11 @@ def retarget_monocular_demonstration(
         task_window = resolve_task_window(
             frame_records,
             video_id=bundle.project.video_id,
-            artifact_roots=(gamma_dir, delta_dir, epsilon_dir, zeta_dir, out_dir),
+          artifact_roots=tuple(
+              path
+              for path in (gamma_dir, delta_dir, epsilon_dir, zeta_dir, out_dir, beta_dir)
+              if path is not None
+          ),
             task_start_frame=task_start_frame,
             task_end_frame=task_end_frame,
         )
@@ -733,7 +743,16 @@ def retarget_monocular_demonstration(
     waypoints, waypoint_clip_diagnostics = _build_waypoints(bundle, pick_position, place_position, support_height)
     joint_waypoints, ik_summary = _solve_waypoint_joints_pinocchio_seed(bundle, waypoints)
     demo_payload = _interpolate_demo(bundle, waypoints, joint_waypoints)
-    robot_base_transform, base_registration = _fit_robot_base_transform(bundle, waypoints, support_bbox)
+    beta_base_path = beta_dir / "camera" / "robot_base_in_metric_world.json" if beta_dir is not None else None
+    if beta_base_path is not None and beta_base_path.exists():
+        beta_base_payload = _load_json(beta_base_path)
+        robot_base_transform = np.asarray(beta_base_payload["X_Br_from_M"], dtype=float)
+        base_registration = dict(beta_base_payload)
+        base_registration.setdefault("registration_method", "nearest_visible_fiducial_proxy")
+        base_registration["source_artifact"] = _path_string(beta_base_path)
+        base_registration["consumed_by_eta"] = True
+    else:
+        robot_base_transform, base_registration = _fit_robot_base_transform(bundle, waypoints, support_bbox)
 
     retarget_dir = out_dir / "retarget"
     for path in (retarget_dir,):

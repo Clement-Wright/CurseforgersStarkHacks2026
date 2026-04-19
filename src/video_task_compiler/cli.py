@@ -531,6 +531,16 @@ def retarget_monocular_demo_cli(
         resolve_path=True,
         help="Bundle root or spec/ directory for the validated contract bundle.",
     ),
+    beta_dir: Optional[Path] = typer.Option(
+        None,
+        "--beta-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Optional Beta artifact root that contains camera/ anchoring outputs.",
+    ),
     gamma_dir: Path = typer.Option(
         ...,
         "--gamma-dir",
@@ -601,6 +611,7 @@ def retarget_monocular_demo_cli(
             raise EtaRetargetError("eta retarget-monocular only supports rgb_monocular capture bundles")
         retarget_monocular_demonstration(
             bundle=bundle,
+            beta_dir=beta_dir,
             gamma_dir=gamma_dir,
             delta_dir=delta_dir,
             epsilon_dir=epsilon_dir,

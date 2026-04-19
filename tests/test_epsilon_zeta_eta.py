@@ -67,6 +67,7 @@ def _install_fake_sim_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(zeta_assets_module, "_load_mujoco_module", lambda: _FakeMujocoModule())
     monkeypatch.setattr(eta_retarget_module, "_load_pinocchio_module", lambda: SimpleNamespace(__name__="pinocchio"))
     monkeypatch.setattr(theta_sim_module, "_load_mujoco_module", lambda: _FakeMujocoModule())
+    monkeypatch.setattr(theta_sim_module, "ensure_theta_dependencies", lambda: None)
 
 
 def _copy_bundle_root(target_root: Path) -> Path:
@@ -84,8 +85,10 @@ def _square_mask(x_min: int, y_min: int, x_max: int, y_max: int, *, size: int = 
 def _write_beta_artifacts(beta_dir: Path) -> None:
     frames_dir = beta_dir / "frames"
     camera_dir = beta_dir / "camera"
+    scene_dir = beta_dir / "scene"
     frames_dir.mkdir(parents=True, exist_ok=True)
     camera_dir.mkdir(parents=True, exist_ok=True)
+    scene_dir.mkdir(parents=True, exist_ok=True)
 
     with (frames_dir / "index.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
@@ -176,6 +179,60 @@ def _write_beta_artifacts(beta_dir: Path) -> None:
         + "\n",
         encoding="utf-8",
     )
+    (camera_dir / "robot_base_in_metric_world.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "0.1.0",
+                "video_id": "demo_0001",
+                "source_world": "M",
+                "target_frame": "Br",
+                "X_Br_from_M": [
+                    [0.0, -1.0, 0.0, 0.18],
+                    [1.0, 0.0, 0.0, -0.34],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+                "registration_method": "nearest_visible_fiducial_proxy",
+                "measured": False,
+                "anchor_selection_policy": "nearest_visible_fiducial",
+                "anchor_marker_id": 7,
+                "anchor_frame_name": "Ft_7",
+                "anchor_translation_tc_m": [0.08, -0.03, 0.55],
+                "anchor_rotation_tc": [
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                "anchor_distance_m": 0.556,
+                "confidence": 0.93,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (scene_dir / "static_geometry_subset.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "0.1.0",
+                "video_id": "demo_0001",
+                "source": "beta_preroll_static_subset",
+                "selection_policy": "registered_preroll_frames",
+                "frames": [
+                    {
+                        "frame_idx": 0,
+                        "frame_name": "frame_000000.png",
+                        "segment": "preroll",
+                        "registered": True,
+                    }
+                ],
+                "keyframe_frame_indices": [0],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _write_delta_artifacts(delta_dir: Path) -> None:
@@ -183,20 +240,25 @@ def _write_delta_artifacts(delta_dir: Path) -> None:
     objects_dir.mkdir(parents=True, exist_ok=True)
 
     masks = [
-        ("obj_target", 1, "target_object", _square_mask(28, 28, 36, 36)),
-        ("obj_target", 2, "target_object", _square_mask(29, 28, 37, 36)),
-        ("obj_receptacle", 1, "receptacle", _square_mask(42, 24, 54, 36)),
-        ("obj_receptacle", 2, "receptacle", _square_mask(42, 24, 54, 36)),
-        ("obj_tabletop", 1, "tabletop", _square_mask(4, 16, 60, 56)),
-        ("obj_tabletop", 2, "tabletop", _square_mask(4, 16, 60, 56)),
+        ("eraser_01_track", "eraser_01", 1, "eraser", _square_mask(18, 30, 24, 34)),
+        ("eraser_01_track", "eraser_01", 2, "eraser", _square_mask(19, 30, 25, 34)),
+        ("eraser_02_track", "eraser_02", 1, "eraser", _square_mask(24, 25, 30, 29)),
+        ("eraser_02_track", "eraser_02", 2, "eraser", _square_mask(25, 25, 31, 29)),
+        ("toothpaste_box_01_track", "toothpaste_box_01", 1, "toothpaste_box", _square_mask(34, 24, 50, 34)),
+        ("toothpaste_box_01_track", "toothpaste_box_01", 2, "toothpaste_box", _square_mask(34, 24, 50, 34)),
+        ("toothpaste_box_02_track", "toothpaste_box_02", 1, "toothpaste_box", _square_mask(36, 10, 52, 20)),
+        ("toothpaste_box_02_track", "toothpaste_box_02", 2, "toothpaste_box", _square_mask(36, 10, 52, 20)),
+        ("tabletop_01_track", "tabletop_01", 1, "tabletop", _square_mask(4, 16, 60, 56)),
+        ("tabletop_01_track", "tabletop_01", 2, "tabletop", _square_mask(4, 16, 60, 56)),
     ]
     mask_ref_by_pair: dict[tuple[str, int], str] = {}
     with (objects_dir / "masks_rle.jsonl").open("w", encoding="utf-8") as handle:
-        for line_number, (track_id, frame_idx, ontology_id, mask) in enumerate(masks, start=1):
+        for line_number, (track_id, instance_id, frame_idx, ontology_id, mask) in enumerate(masks, start=1):
             handle.write(
                 json.dumps(
                     {
                         "track_id": track_id,
+                        "instance_id": instance_id,
                         "frame_idx": frame_idx,
                         "ontology_id": ontology_id,
                         "rle": encode_coco_rle_mask(mask),
@@ -211,57 +273,112 @@ def _write_delta_artifacts(delta_dir: Path) -> None:
         "video_id": "demo_0001",
         "tracks": [
             {
-                "track_id": "obj_target",
-                "ontology_id": "target_object",
-                "class_name": "target_object",
+                "track_id": "eraser_01_track",
+                "instance_id": "eraser_01",
+                "ontology_id": "eraser",
+                "class_name": "eraser",
                 "frames": [
                     {
                         "frame_idx": 1,
                         "t_ns": 1_000_000_000,
-                        "bbox_xyxy": [28.0, 28.0, 36.0, 36.0],
-                        "centroid_uv": [32.0, 32.0],
+                        "bbox_xyxy": [18.0, 30.0, 24.0, 34.0],
+                        "centroid_uv": [21.0, 32.0],
                         "visible": True,
                         "score": 0.95,
-                        "mask_rle_ref": mask_ref_by_pair[("obj_target", 1)],
+                        "mask_rle_ref": mask_ref_by_pair[("eraser_01_track", 1)],
                     },
                     {
                         "frame_idx": 2,
                         "t_ns": 2_000_000_000,
-                        "bbox_xyxy": [29.0, 28.0, 37.0, 36.0],
-                        "centroid_uv": [33.0, 32.0],
+                        "bbox_xyxy": [19.0, 30.0, 25.0, 34.0],
+                        "centroid_uv": [22.0, 32.0],
                         "visible": True,
                         "score": 0.94,
-                        "mask_rle_ref": mask_ref_by_pair[("obj_target", 2)],
+                        "mask_rle_ref": mask_ref_by_pair[("eraser_01_track", 2)],
                     },
                 ],
             },
             {
-                "track_id": "obj_receptacle",
-                "ontology_id": "receptacle",
-                "class_name": "receptacle",
+                "track_id": "eraser_02_track",
+                "instance_id": "eraser_02",
+                "ontology_id": "eraser",
+                "class_name": "eraser",
                 "frames": [
                     {
                         "frame_idx": 1,
                         "t_ns": 1_000_000_000,
-                        "bbox_xyxy": [42.0, 24.0, 54.0, 36.0],
-                        "centroid_uv": [48.0, 30.0],
+                        "bbox_xyxy": [24.0, 25.0, 30.0, 29.0],
+                        "centroid_uv": [27.0, 27.0],
                         "visible": True,
-                        "score": 0.97,
-                        "mask_rle_ref": mask_ref_by_pair[("obj_receptacle", 1)],
+                        "score": 0.93,
+                        "mask_rle_ref": mask_ref_by_pair[("eraser_02_track", 1)],
                     },
                     {
                         "frame_idx": 2,
                         "t_ns": 2_000_000_000,
-                        "bbox_xyxy": [42.0, 24.0, 54.0, 36.0],
-                        "centroid_uv": [48.0, 30.0],
+                        "bbox_xyxy": [25.0, 25.0, 31.0, 29.0],
+                        "centroid_uv": [28.0, 27.0],
                         "visible": True,
-                        "score": 0.97,
-                        "mask_rle_ref": mask_ref_by_pair[("obj_receptacle", 2)],
+                        "score": 0.92,
+                        "mask_rle_ref": mask_ref_by_pair[("eraser_02_track", 2)],
                     },
                 ],
             },
             {
-                "track_id": "obj_tabletop",
+                "track_id": "toothpaste_box_01_track",
+                "instance_id": "toothpaste_box_01",
+                "ontology_id": "toothpaste_box",
+                "class_name": "toothpaste_box",
+                "frames": [
+                    {
+                        "frame_idx": 1,
+                        "t_ns": 1_000_000_000,
+                        "bbox_xyxy": [34.0, 24.0, 50.0, 34.0],
+                        "centroid_uv": [42.0, 29.0],
+                        "visible": True,
+                        "score": 0.97,
+                        "mask_rle_ref": mask_ref_by_pair[("toothpaste_box_01_track", 1)],
+                    },
+                    {
+                        "frame_idx": 2,
+                        "t_ns": 2_000_000_000,
+                        "bbox_xyxy": [34.0, 24.0, 50.0, 34.0],
+                        "centroid_uv": [42.0, 29.0],
+                        "visible": True,
+                        "score": 0.97,
+                        "mask_rle_ref": mask_ref_by_pair[("toothpaste_box_01_track", 2)],
+                    },
+                ],
+            },
+            {
+                "track_id": "toothpaste_box_02_track",
+                "instance_id": "toothpaste_box_02",
+                "ontology_id": "toothpaste_box",
+                "class_name": "toothpaste_box",
+                "frames": [
+                    {
+                        "frame_idx": 1,
+                        "t_ns": 1_000_000_000,
+                        "bbox_xyxy": [36.0, 10.0, 52.0, 20.0],
+                        "centroid_uv": [44.0, 15.0],
+                        "visible": True,
+                        "score": 0.96,
+                        "mask_rle_ref": mask_ref_by_pair[("toothpaste_box_02_track", 1)],
+                    },
+                    {
+                        "frame_idx": 2,
+                        "t_ns": 2_000_000_000,
+                        "bbox_xyxy": [36.0, 10.0, 52.0, 20.0],
+                        "centroid_uv": [44.0, 15.0],
+                        "visible": True,
+                        "score": 0.96,
+                        "mask_rle_ref": mask_ref_by_pair[("toothpaste_box_02_track", 2)],
+                    },
+                ],
+            },
+            {
+                "track_id": "tabletop_01_track",
+                "instance_id": "tabletop_01",
                 "ontology_id": "tabletop",
                 "class_name": "tabletop",
                 "frames": [
@@ -272,7 +389,7 @@ def _write_delta_artifacts(delta_dir: Path) -> None:
                         "centroid_uv": [32.0, 36.0],
                         "visible": True,
                         "score": 0.99,
-                        "mask_rle_ref": mask_ref_by_pair[("obj_tabletop", 1)],
+                        "mask_rle_ref": mask_ref_by_pair[("tabletop_01_track", 1)],
                     },
                     {
                         "frame_idx": 2,
@@ -281,7 +398,7 @@ def _write_delta_artifacts(delta_dir: Path) -> None:
                         "centroid_uv": [32.0, 36.0],
                         "visible": True,
                         "score": 0.99,
-                        "mask_rle_ref": mask_ref_by_pair[("obj_tabletop", 2)],
+                        "mask_rle_ref": mask_ref_by_pair[("tabletop_01_track", 2)],
                     },
                 ],
             },
@@ -294,12 +411,14 @@ def _write_delta_artifacts(delta_dir: Path) -> None:
             "video_id": "demo_0001",
             "frame_idx": 2,
             "t_ns": 2_000_000_000,
-            "track_id": "obj_target",
-            "class_name": "target_object",
-            "centroid_u": 33.0,
+            "track_id": "eraser_01_track",
+            "instance_id": "eraser_01",
+            "ontology_id": "eraser",
+            "class_name": "eraser",
+            "centroid_u": 22.0,
             "centroid_v": 32.0,
             "visible": True,
-            "wrist_u": 36.0,
+            "wrist_u": 24.0,
             "wrist_v": 36.0,
             "wrist_conf": 0.9,
             "pixel_distance_wrist_to_mask": 0.0,
@@ -309,13 +428,15 @@ def _write_delta_artifacts(delta_dir: Path) -> None:
             "video_id": "demo_0001",
             "frame_idx": 2,
             "t_ns": 2_000_000_000,
-            "track_id": "obj_receptacle",
-            "class_name": "receptacle",
-            "centroid_u": 48.0,
-            "centroid_v": 30.0,
+            "track_id": "toothpaste_box_01_track",
+            "instance_id": "toothpaste_box_01",
+            "ontology_id": "toothpaste_box",
+            "class_name": "toothpaste_box",
+            "centroid_u": 42.0,
+            "centroid_v": 29.0,
             "visible": True,
-            "wrist_u": 56.0,
-            "wrist_v": 20.0,
+            "wrist_u": 44.0,
+            "wrist_v": 24.0,
             "wrist_conf": 0.92,
             "pixel_distance_wrist_to_mask": 0.0,
             "likely_contact_boolean": True,
@@ -406,7 +527,7 @@ def test_compile_metric_scene_writes_truthful_proxy_epsilon_outputs(tmp_path: Pa
 
     summary = compile_metric_scene(bundle=bundle, beta_dir=beta_dir, delta_dir=delta_dir, out_dir=run_dir)
 
-    assert summary["geometry_mode"] == "proxy_scene"
+    assert summary["geometry_mode"] == "dense_static_reconstruction"
     assert summary["metric_alignment_mode"] == "inherited_from_beta"
     assert summary["qa"]["support_plane_rmse_m"] is None
     assert summary["qc_flags"]["truthful_provenance_ok"] is True
@@ -419,13 +540,20 @@ def test_compile_metric_scene_writes_truthful_proxy_epsilon_outputs(tmp_path: Pa
     assert world_metric["transform_source"] == "inherited_from_beta_fiducial_world"
     assert world_metric["measured"] is False
     object_payload = json.loads((run_dir / "scene" / "object_init_poses_metric.json").read_text(encoding="utf-8"))
-    assert {obj["ontology_id"] for obj in object_payload["objects"]} == {"target_object", "receptacle"}
-    assert all(obj["geometry_source"] == "proxy_box_surface" for obj in object_payload["objects"])
+    assert {obj["instance_id"] for obj in object_payload["objects"]} == {
+        "eraser_01",
+        "eraser_02",
+        "toothpaste_box_01",
+        "toothpaste_box_02",
+    }
+    assert {obj["ontology_id"] for obj in object_payload["objects"]} == {"eraser", "toothpaste_box"}
+    assert all(obj["geometry_source"] in {"mask_backprojected_cuboid", "scene_instance_size_prior_cuboid"} for obj in object_payload["objects"])
     assert all(obj["footprint_estimator"] == "support_plane_mask_obb" for obj in object_payload["objects"])
     assert all(obj["height_mode"] == "proxy_default_height" for obj in object_payload["objects"])
     assert all(len(obj["frames_used"]) >= 1 for obj in object_payload["objects"])
     assert all(obj["extents_m"][2] == pytest.approx(bundle.project.epsilon.default_object_height_m) for obj in object_payload["objects"])
     assert all(max(obj["extents_m"][:2]) < 0.25 for obj in object_payload["objects"])
+    assert all((run_dir / obj["mesh_path"]).exists() for obj in object_payload["objects"])
     assert summary["object_geometry_diagnostics"]
 
 
@@ -444,10 +572,11 @@ def test_assetize_metric_scene_writes_proxy_assets_and_validates_mujoco(tmp_path
     assert (run_dir / "sim" / "assets_only.xml").exists()
     assert (run_dir / "sim" / "assets_only.mjb").exists()
     manifest = json.loads((run_dir / "assets" / "manifest.json").read_text(encoding="utf-8"))
-    assert len(manifest["objects"]) == 2
-    assert manifest["asset_mode"] == "proxy_visual_and_collision"
+    assert len(manifest["objects"]) == 4
+    assert manifest["asset_mode"] == "geometry_backed_assets"
     assert all(Path(run_dir / obj["visual_mesh"]).exists() for obj in manifest["objects"])
-    assert all(obj["source_kind"] == "proxy_box_asset" for obj in manifest["objects"])
+    assert all(obj["visual_geometry_mode"] == "geometry_backed_visual" for obj in manifest["objects"])
+    assert all(Path(run_dir / obj["collision_meshes"][0]).exists() for obj in manifest["objects"])
     assert all(Path(run_dir / obj["metadata_ref"]).exists() for obj in manifest["objects"])
 
 
@@ -459,6 +588,7 @@ def test_retarget_demonstration_writes_eta_outputs(tmp_path: Path, monkeypatch: 
 
     summary = retarget_monocular_demonstration(
         bundle=bundle,
+        beta_dir=beta_dir,
         gamma_dir=gamma_dir,
         delta_dir=delta_dir,
         epsilon_dir=run_dir,
@@ -480,9 +610,11 @@ def test_retarget_demonstration_writes_eta_outputs(tmp_path: Path, monkeypatch: 
     assert len(demo_payload["t_ns"]) == summary["retarget_frame_count"]
     assert "replay" not in summary
     robot_base_payload = json.loads((run_dir / "retarget" / "robot_base_in_metric_world.json").read_text(encoding="utf-8"))
-    assert robot_base_payload["registration_method"] == "automatic_trace_fit_proxy"
+    assert robot_base_payload["registration_method"] == "nearest_visible_fiducial_proxy"
+    assert robot_base_payload["anchor_selection_policy"] == "nearest_visible_fiducial"
     assert not np.allclose(np.asarray(robot_base_payload["X_Br_from_M"], dtype=float), np.eye(4), atol=1e-6)
     assert summary["qc_flags"]["robot_base_identity_ok"] is True
+    assert summary["robot_base_registration"]["consumed_by_eta"] is True
     assert "target_position_diagnostics" in summary
     assert "waypoint_clip_diagnostics" in summary
 
@@ -510,6 +642,7 @@ def test_eta_uses_persisted_task_window_by_default(tmp_path: Path, monkeypatch: 
 
     summary = retarget_monocular_demonstration(
         bundle=bundle,
+        beta_dir=beta_dir,
         gamma_dir=gamma_dir,
         delta_dir=delta_dir,
         epsilon_dir=run_dir,
@@ -566,6 +699,8 @@ def test_epsilon_zeta_eta_cli_pipeline_succeeds(tmp_path: Path, monkeypatch: pyt
             str(bundle_root / "spec"),
             "--gamma-dir",
             str(gamma_dir),
+            "--beta-dir",
+            str(beta_dir),
             "--delta-dir",
             str(delta_dir),
             "--epsilon-dir",
@@ -591,6 +726,7 @@ def test_compile_task_package_writes_theta_outputs(tmp_path: Path, monkeypatch: 
     assetize_metric_scene(bundle=bundle, epsilon_dir=run_dir, out_dir=run_dir)
     retarget_monocular_demonstration(
         bundle=bundle,
+        beta_dir=beta_dir,
         gamma_dir=gamma_dir,
         delta_dir=delta_dir,
         epsilon_dir=run_dir,
@@ -611,6 +747,7 @@ def test_compile_task_package_writes_theta_outputs(tmp_path: Path, monkeypatch: 
     assert validation["qc_flags"]["mjb_load_ok"] is True
     assert validation["qc_flags"]["trace_smoke_ok"] is True
     assert validation["qc_flags"]["audit_render_ok"] is True
+    assert validation["qc_flags"]["playback_renders_ok"] is True
     assert validation["qc_flags"]["robot_ghost_visible"] is True
     assert validation["qc_flags"]["human_ghost_visible"] is True
     assert validation["qc_flags"]["robot_base_identity_ok"] is True
@@ -621,9 +758,14 @@ def test_compile_task_package_writes_theta_outputs(tmp_path: Path, monkeypatch: 
     assert (run_dir / "sim" / "validation.json").exists()
     assert (run_dir / "sim" / "playback" / "robot_trace.npz").exists()
     assert (run_dir / "sim" / "playback" / "human_arm_ghost.npz").exists()
+    assert (run_dir / "sim" / "playback" / "audit_camera.mp4").exists()
+    assert (run_dir / "sim" / "playback" / "debug_camera.mp4").exists()
     task_payload = json.loads((run_dir / "sim" / "task.json").read_text(encoding="utf-8"))
     assert task_payload["task"]["success_metric"] == "object_in_target_region"
+    assert task_payload["task"]["family"] == "tabletop_stacking"
     assert len(task_payload["task"]["normalized_events"]) == 7
+    assert len(task_payload["task"]["scene_instances"]) >= 5
+    assert task_payload["task"]["goals"][0]["goal_id"] == "stack_white_erasers"
     assert "declared_target_region_m" in task_payload["task"]
     assert "runtime_target_region_m" in task_payload["task"]
     assert task_payload["task"]["runtime_region_resolution"] == "auto_reanchored_from_scene"
@@ -671,6 +813,8 @@ def test_cli_theta_pipeline_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyP
             str(bundle_root / "spec"),
             "--gamma-dir",
             str(gamma_dir),
+            "--beta-dir",
+            str(beta_dir),
             "--delta-dir",
             str(delta_dir),
             "--epsilon-dir",

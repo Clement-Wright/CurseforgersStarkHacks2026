@@ -1250,7 +1250,7 @@ def write_camera_poses_json(
     payload: dict[str, Any] = {
         "schema_version": PROJECT_SCHEMA_VERSION,
         "video_id": bundle.project.video_id,
-        "coordinate_frame": "fiducial_world",
+        "coordinate_frame": bundle.project.coord_frames.project_world,
         "camera_frame_convention": "COLMAP/OpenCV optical frame: +x right, +y down, +z forward",
         "time_base": "ns_from_first_decoded_frame",
         "units": "meters",
@@ -1277,6 +1277,88 @@ def write_camera_poses_json(
             entry["quaternion_wxyz"] = rotation_matrix_to_quaternion(pose.rotation_wc).tolist()
         payload["frames"].append(entry)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _rotation_z(theta_rad: float) -> np.ndarray:
+    cosine = math.cos(theta_rad)
+    sine = math.sin(theta_rad)
+    return np.array(
+        [
+            [cosine, -sine, 0.0],
+            [sine, cosine, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+
+
+def _nearest_visible_fiducial(detections: Sequence[FiducialDetection]) -> FiducialDetection:
+    if not detections:
+        raise VideoIngestError("beta robot-base anchoring requires at least one visible fiducial detection")
+    return min(detections, key=lambda detection: float(np.linalg.norm(detection.translation_tc)))
+
+
+def write_robot_base_in_metric_world_json(
+    path: Path,
+    bundle: SpecBundle,
+    detections: Sequence[FiducialDetection],
+) -> dict[str, Any]:
+    anchor = _nearest_visible_fiducial(detections)
+    anchor_translation = np.asarray(anchor.translation_tc, dtype=float)
+    base_translation = anchor_translation + np.array([0.0, -0.55, 0.0], dtype=float)
+    base_translation[2] = 0.0
+    transform = np.eye(4, dtype=float)
+    transform[:3, :3] = _rotation_z(math.pi / 2.0)
+    transform[:3, 3] = base_translation
+    anchor_distance = float(np.linalg.norm(anchor_translation))
+    payload = {
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "video_id": bundle.project.video_id,
+        "source_world": bundle.project.coord_frames.project_world,
+        "target_frame": bundle.robot.base_frame,
+        "X_Br_from_M": transform.tolist(),
+        "registration_method": "nearest_visible_fiducial_proxy",
+        "measured": False,
+        "anchor_selection_policy": "nearest_visible_fiducial",
+        "anchor_marker_id": int(anchor.marker_id),
+        "anchor_frame_name": anchor.frame_name,
+        "anchor_translation_tc_m": anchor_translation.tolist(),
+        "anchor_rotation_tc": np.asarray(anchor.rotation_tc, dtype=float).tolist(),
+        "anchor_distance_m": anchor_distance,
+        "confidence": float(1.0 / (1.0 + anchor_distance)),
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return payload
+
+
+def write_static_geometry_subset_json(
+    path: Path,
+    bundle: SpecBundle,
+    records: Sequence[FrameRecord],
+) -> dict[str, Any]:
+    static_records = [record for record in records if record.segment == "preroll" and record.registered]
+    keyframe_records = [record for record in static_records if record.is_keyframe]
+    payload = {
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "video_id": bundle.project.video_id,
+        "source": "beta_preroll_static_subset",
+        "selection_policy": "registered_preroll_frames",
+        "frames": [
+            {
+                "frame_idx": int(record.frame_index),
+                "frame_name": record.frame_name,
+                "image_path": _path_string(record.image_path),
+                "pts_sec": float(record.pts_sec),
+                "t_ns": int(record.t_ns),
+                "is_keyframe": bool(record.is_keyframe),
+                "pose_status": record.pose_status,
+            }
+            for record in static_records
+        ],
+        "keyframe_frame_indices": [int(record.frame_index) for record in keyframe_records],
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return payload
 
 
 def write_sparse_points_ply(path: Path, model: ParsedColmapModel) -> None:
@@ -1308,6 +1390,8 @@ def build_summary(
     similarity: SimilarityTransform,
     reprojection_stats: ReprojectionStats,
     pose_map: dict[int, PoseEstimate],
+    robot_base_anchor: dict[str, Any] | None = None,
+    static_geometry_subset: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     preroll_keyframes = [record for record in records if record.segment == "preroll" and record.is_keyframe]
     registered_preroll_keyframes = [record for record in preroll_keyframes if record.registered]
@@ -1381,6 +1465,16 @@ def build_summary(
             "unlocalized_frames": len(unlocalized_frames),
             "pose_entries": len(pose_map),
             "largest_interpolation_gap_s": largest_interpolation_gap_s,
+        },
+        "robot_base_anchor": robot_base_anchor,
+        "static_geometry_subset": {
+            "frame_count": len(static_geometry_subset.get("frames", [])) if isinstance(static_geometry_subset, dict) else 0,
+            "keyframe_count": len(static_geometry_subset.get("keyframe_frame_indices", []))
+            if isinstance(static_geometry_subset, dict)
+            else 0,
+            "selection_policy": static_geometry_subset.get("selection_policy")
+            if isinstance(static_geometry_subset, dict)
+            else None,
         },
         "capture_contract_mismatches": mismatches,
     }
@@ -1472,6 +1566,16 @@ def ingest_monocular_video(
     write_camera_intrinsics_json(out_dir / "camera_intrinsics.json", bundle, camera)
     write_camera_poses_json(camera_dir / "camera_poses.json", bundle, records, pose_map)
     write_camera_poses_json(out_dir / "camera_poses.json", bundle, records, pose_map)
+    robot_base_anchor = write_robot_base_in_metric_world_json(
+        camera_dir / "robot_base_in_metric_world.json",
+        bundle,
+        detections,
+    )
+    static_geometry_subset = write_static_geometry_subset_json(
+        scene_dir / "static_geometry_subset.json",
+        bundle,
+        records,
+    )
     write_sparse_points_ply(scene_dir / "sparse_points.ply", pipeline.final_model)
 
     summary = build_summary(
@@ -1484,6 +1588,8 @@ def ingest_monocular_video(
         similarity=similarity,
         reprojection_stats=reprojection_stats,
         pose_map=pose_map,
+        robot_base_anchor=robot_base_anchor,
+        static_geometry_subset=static_geometry_subset,
     )
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     enforce_stability_thresholds(bundle=bundle, summary=summary)

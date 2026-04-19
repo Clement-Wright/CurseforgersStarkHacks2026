@@ -64,6 +64,7 @@ class PromptSpec:
     label: str
     prompt_text: str
     task_reference_prompt: str | None
+    declared_instance_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -222,11 +223,33 @@ def build_object_prompt_specs(bundle: SpecBundle) -> list[PromptSpec]:
         bundle.task.pick_object.ontology_id: bundle.task.pick_object.text_prompt,
         bundle.task.place_region.ontology_id: bundle.task.place_region.text_prompt,
     }
-    ordered_ids = [
+    scene_instance_ids_by_class: dict[str, list[str]] = {}
+    scene_prompt_text_by_class: dict[str, str] = {}
+    ordered_ids: list[str] = []
+    for instance in bundle.task.scene_instances:
+        scene_instance_ids_by_class.setdefault(instance.ontology_id, []).append(instance.instance_id)
+        if instance.prompt_text and instance.ontology_id not in scene_prompt_text_by_class:
+            scene_prompt_text_by_class[instance.ontology_id] = instance.prompt_text
+        entity = ontology_lookup.get(instance.ontology_id)
+        if entity is None or entity.kind == "region":
+            continue
+        if instance.ontology_id not in ordered_ids:
+            ordered_ids.append(instance.ontology_id)
+
+    for ontology_id in (
         bundle.project.ontology.target_object_id,
         bundle.project.ontology.receptacle_object_id,
         bundle.project.ontology.support_surface_id,
-    ]
+        *bundle.project.ontology.reference_object_ids,
+        *( [bundle.project.ontology.fiducial_board_id] if bundle.project.ontology.fiducial_board_id else [] ),
+    ):
+        if not ontology_id or ontology_id in ordered_ids:
+            continue
+        entity = ontology_lookup.get(ontology_id)
+        if entity is None or entity.kind == "region":
+            continue
+        ordered_ids.append(ontology_id)
+
     if len(ordered_ids) != len(set(ordered_ids)):
         raise ObjectExtractError("project ontology ids must be unique for delta extraction")
 
@@ -241,8 +264,12 @@ def build_object_prompt_specs(bundle: SpecBundle) -> list[PromptSpec]:
                 class_name=ontology_id,
                 kind=entity.kind,
                 label=entity.label,
-                prompt_text=entity.label,
+                prompt_text=scene_prompt_text_by_class.get(
+                    ontology_id,
+                    task_reference_prompts.get(ontology_id) or entity.label,
+                ),
                 task_reference_prompt=task_reference_prompts.get(ontology_id),
+                declared_instance_ids=tuple(scene_instance_ids_by_class.get(ontology_id, [])),
             )
         )
     return prompts
@@ -575,6 +602,19 @@ def _canonical_track_order(raw_tracks: Iterable[dict[str, Any]], prompts: Sequen
     return sorted((track for track in raw_tracks if isinstance(track, dict)), key=track_sort_key)
 
 
+def _assigned_instance_id(
+    prompt: PromptSpec,
+    *,
+    assigned_count: int,
+    explicit_instance_id: str | None = None,
+) -> str:
+    if explicit_instance_id:
+        return explicit_instance_id
+    if assigned_count < len(prompt.declared_instance_ids):
+        return str(prompt.declared_instance_ids[assigned_count])
+    return f"{prompt.ontology_id}_{assigned_count + 1:02d}"
+
+
 def normalize_grounded_sam2_tracks(
     raw_payload: dict[str, Any],
     frame_records: Sequence[DeltaFrameRecord],
@@ -591,6 +631,7 @@ def normalize_grounded_sam2_tracks(
     normalized_tracks: list[dict[str, Any]] = []
     rle_decode_success = True
     inferred_counts: dict[str, int] = {}
+    assigned_instance_counts: dict[str, int] = {}
 
     for raw_track in ordered_tracks:
         ontology_id = _infer_ontology_id(raw_track, prompts)
@@ -601,6 +642,12 @@ def normalize_grounded_sam2_tracks(
         if not track_id:
             inferred_counts[ontology_id] = inferred_counts.get(ontology_id, 0) + 1
             track_id = f"{ontology_id}_{inferred_counts[ontology_id]:03d}"
+        instance_id = _assigned_instance_id(
+            prompt,
+            assigned_count=assigned_instance_counts.get(prompt.ontology_id, 0),
+            explicit_instance_id=str(raw_track.get("instance_id", "")).strip() or None,
+        )
+        assigned_instance_counts[prompt.ontology_id] = assigned_instance_counts.get(prompt.ontology_id, 0) + 1
 
         seen_frame_indices: set[int] = set()
         normalized_frames: list[dict[str, Any]] = []
@@ -627,6 +674,8 @@ def normalize_grounded_sam2_tracks(
                 masks_entries.append(
                     {
                         "track_id": track_id,
+                        "instance_id": instance_id,
+                        "ontology_id": prompt.ontology_id,
                         "frame_idx": frame_idx,
                         "size": rle_payload["size"],
                         "counts": rle_payload["counts"],
@@ -656,6 +705,7 @@ def normalize_grounded_sam2_tracks(
             normalized_tracks.append(
                 {
                     "track_id": track_id,
+                    "instance_id": instance_id,
                     "ontology_id": prompt.ontology_id,
                     "class_name": prompt.class_name,
                     "source": str(raw_payload.get("source", "Grounded-SAM-2")),
@@ -796,6 +846,8 @@ def build_interaction_rows(
                     "frame_idx": int(frame["frame_idx"]),
                     "t_ns": int(frame["t_ns"]),
                     "track_id": track["track_id"],
+                    "instance_id": track.get("instance_id"),
+                    "ontology_id": track["ontology_id"],
                     "class_name": track["class_name"],
                     "centroid_u": centroid[0],
                     "centroid_v": centroid[1],
@@ -884,7 +936,7 @@ def write_object_overlays(
                 draw.point(_mask_boundary_points(mask), fill=color)
             draw.text(
                 (float(bbox[0]) + 4.0, max(0.0, float(bbox[1]) - 14.0)),
-                f"{frame_payload['track_id']}:{frame_payload['class_name']}",
+                f"{frame_payload.get('instance_id') or frame_payload['track_id']}:{frame_payload['class_name']}",
                 fill=color,
             )
         wrist = wrist_observations.get(frame_idx)
@@ -910,15 +962,18 @@ def _duplicate_id_count_for_review_sample(
     review_frame_indices: Sequence[int],
 ) -> int:
     review_set = set(review_frame_indices)
-    per_frame_class_counts: dict[tuple[int, str], int] = {}
+    per_frame_instance_counts: dict[tuple[int, str], int] = {}
     for track in normalized_payload.get("tracks", []):
+        instance_id = str(track.get("instance_id", track.get("track_id", ""))).strip()
+        if not instance_id:
+            continue
         for frame in track["frames"]:
             frame_idx = int(frame["frame_idx"])
             if frame_idx not in review_set or not frame["visible"]:
                 continue
-            key = (frame_idx, track["class_name"])
-            per_frame_class_counts[key] = per_frame_class_counts.get(key, 0) + 1
-    return sum(max(0, count - 1) for count in per_frame_class_counts.values())
+            key = (frame_idx, instance_id)
+            per_frame_instance_counts[key] = per_frame_instance_counts.get(key, 0) + 1
+    return sum(max(0, count - 1) for count in per_frame_instance_counts.values())
 
 
 def write_jsonl(path: Path, rows: Sequence[dict[str, Any]]) -> None:
@@ -956,6 +1011,7 @@ def write_prompts_yaml(
                 "label": prompt.label,
                 "prompt_text": prompt.prompt_text,
                 "task_reference_prompt": prompt.task_reference_prompt,
+                "declared_instance_ids": list(prompt.declared_instance_ids),
             }
             for prompt in prompts
         ],
@@ -981,11 +1037,20 @@ def build_delta_summary(
     task_window: TaskWindow,
 ) -> dict[str, Any]:
     track_counts_by_class: dict[str, int] = {prompt.ontology_id: 0 for prompt in prompts}
+    track_counts_by_instance: dict[str, int] = {}
     for track in normalized_payload.get("tracks", []):
         track_counts_by_class[track["class_name"]] = track_counts_by_class.get(track["class_name"], 0) + 1
+        instance_id = str(track.get("instance_id", "")).strip()
+        if instance_id:
+            track_counts_by_instance[instance_id] = track_counts_by_instance.get(instance_id, 0) + 1
     class_coverage = {
         prompt.ontology_id: track_counts_by_class.get(prompt.ontology_id, 0) > 0
         for prompt in prompts
+    }
+    instance_coverage = {
+        instance_id: track_counts_by_instance.get(instance_id, 0) > 0
+        for prompt in prompts
+        for instance_id in prompt.declared_instance_ids
     }
     duplicate_count = _duplicate_id_count_for_review_sample(normalized_payload, review_frame_indices)
     interaction_counts = {
@@ -1012,7 +1077,9 @@ def build_delta_summary(
         },
         "track_count": len(normalized_payload.get("tracks", [])),
         "track_count_by_class": track_counts_by_class,
+        "track_count_by_instance": track_counts_by_instance,
         "class_coverage": class_coverage,
+        "instance_coverage": instance_coverage,
         "review_sample_frame_count": len(review_frame_indices),
         "duplicate_id_count_in_review_sample": duplicate_count,
         "mean_labeled_mask_iou": None,

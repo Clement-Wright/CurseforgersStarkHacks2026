@@ -1,12 +1,18 @@
 schema_version: 0.1.0
-ontology_name: tabletop_pick_place_v1
+ontology_name: tabletop_stacking_v1
 entities:
-  - id: target_object
+  - id: eraser
     kind: object
-    label: red cube
-  - id: receptacle
+    label: white eraser
+  - id: toothpaste_box
     kind: object
-    label: black tray
+    label: toothpaste box
   - id: tabletop
     kind: surface
     label: tabletop
+  - id: fiducial_board
+    kind: object
+    label: fiducial board
+  - id: stack_zone
+    kind: region
+    label: stack zone

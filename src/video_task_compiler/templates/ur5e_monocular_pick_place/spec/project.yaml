@@ -2,13 +2,13 @@ schema_version: 0.1.0
 project_name: monocular_video_to_robot_frontend
 video_id: demo_0001
 sample_raw_video: video/raw/demo_0001.mp4
-task_name: pick_and_place_single_object
+task_name: tabletop_stacking_multi_instance
 demo_owner: robotics-team
 artifact_owners:
   alpha: tech-lead
   beta: sfm-lead
   gamma: perception-lead
-  delta: simulation-lead
+  delta: perception-lead
   epsilon: geometry-lead
   zeta: asset-lead
   eta: controls-lead
@@ -40,7 +40,7 @@ gamma:
 delta:
   primary_backbone: grounded_sam2
   annotation_frame_policy: best_preroll_then_active
-  track_scope: ontology_only
+  track_scope: instance_aware
   overlay_sample_count: 20
   interaction:
     contact_distance_px: 20
@@ -48,23 +48,23 @@ delta:
   mask_encoding: coco_rle
 epsilon:
   primary_backbone: artifact_fusion
-  geometry_mode: proxy_scene
+  geometry_mode: dense_static_reconstruction
   metric_alignment_mode: inherited_from_beta
   preserve_beta_world: true
   metric_world_frame: M
-  support_plane_source: task_region_prior
+  support_plane_source: geometry_fit
   default_object_height_m: 0.04
   qc_overlay_frame_count: 12
 zeta:
   primary_backbone: mujoco_safe_assets
-  asset_mode: proxy_visual_and_collision
+  asset_mode: geometry_backed_assets
   collision_strategy: obb_single
   max_collision_geoms_per_object: 1
   require_mujoco_compile: true
 eta:
   primary_backbone: arm_gripper_waypoint_replay
   execution_mode: arm_gripper_waypoint_replay
-  retarget_mode: planar_pick_place
+  retarget_mode: measured_world_replay
   ik_backend: pinocchio_seed
   pregrasp_clearance_m: 0.08
   transport_clearance_m: 0.12
@@ -78,9 +78,12 @@ theta:
   robot_model_source: vendored_local_copy
   human_ghost_mode: arm_observables
 ontology:
-  target_object_id: target_object
-  receptacle_object_id: receptacle
+  target_object_id: eraser
+  receptacle_object_id: toothpaste_box
   support_surface_id: tabletop
+  reference_object_ids:
+    - toothpaste_box
+  fiducial_board_id: fiducial_board
 sponsor_resources:
   - rgb_monocular_capture
   - colmap_gpu_node
@@ -112,3 +115,4 @@ acceptance:
   theta_require_audit_render: true
   theta_require_robot_ghost_visible: true
   theta_require_human_ghost_visible: true
+  theta_require_playback_renders: true

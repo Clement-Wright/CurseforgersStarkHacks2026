@@ -180,6 +180,7 @@ def _write_object_metadata(path: Path, manifest_object: dict[str, Any], *, world
     payload = {
         "schema_version": PROJECT_SCHEMA_VERSION,
         "track_id": manifest_object["track_id"],
+        "instance_id": manifest_object.get("instance_id"),
         "ontology_id": manifest_object["ontology_id"],
         "class_name": manifest_object["class_name"],
         "world_frame": world_frame,
@@ -275,10 +276,10 @@ def assetize_metric_scene(
     out_dir: Path,
 ) -> dict[str, Any]:
     ensure_zeta_dependencies()
-    if bundle.project.zeta.asset_mode != "proxy_visual_and_collision":
+    if bundle.project.zeta.asset_mode not in {"proxy_visual_and_collision", "geometry_backed_assets"}:
         raise ZetaAssetError(
             f"zeta asset_mode '{bundle.project.zeta.asset_mode}' is not implemented yet; "
-            "the current MVP supports only proxy_visual_and_collision"
+            "the current MVP supports proxy_visual_and_collision and geometry_backed_assets"
         )
 
     scene_dir = epsilon_dir / "scene"
@@ -328,9 +329,17 @@ def assetize_metric_scene(
         asset_name = _sanitize_name(str(obj["track_id"]))
         extents = np.asarray(obj.get("extents_m", [0.04, 0.04, 0.04]), dtype=float)
         vertices, faces = _box_vertices_faces(np.zeros(3, dtype=float), extents)
+        source_mesh_rel = str(obj.get("mesh_path", "")).strip()
         visual_path = assets_dir / f"{asset_name}_visual.obj"
         collision_path = assets_dir / f"{asset_name}_collision_00.obj"
-        _write_obj_mesh(visual_path, vertices, faces)
+        if source_mesh_rel:
+            source_mesh_path = epsilon_dir / source_mesh_rel
+            if source_mesh_path.exists():
+                shutil.copyfile(source_mesh_path, visual_path)
+            else:
+                _write_obj_mesh(visual_path, vertices, faces)
+        else:
+            _write_obj_mesh(visual_path, vertices, faces)
         _write_obj_mesh(collision_path, vertices, faces)
         position = [float(value) for value in obj["position_m"]]
         extents = [float(value) for value in obj["extents_m"]]
@@ -338,6 +347,7 @@ def assetize_metric_scene(
         bbox_max = [position[0] + 0.5 * extents[0], position[1] + 0.5 * extents[1], position[2] + 0.5 * extents[2]]
         manifest_object = {
             "track_id": obj["track_id"],
+            "instance_id": obj.get("instance_id"),
             "ontology_id": obj["ontology_id"],
             "class_name": obj["class_name"],
             "position_m": position,
@@ -345,8 +355,10 @@ def assetize_metric_scene(
             "visual_mesh": f"assets/{visual_path.name}",
             "collision_meshes": [f"assets/{collision_path.name}"],
             "collision_geom_count": 1,
-            "source_kind": "proxy_box_asset",
-            "visual_geometry_mode": "proxy_box_visual",
+            "source_kind": obj.get("geometry_source", "proxy_box_asset"),
+            "visual_geometry_mode": "geometry_backed_visual"
+            if source_mesh_rel
+            else "proxy_box_visual",
             "collision_geometry_mode": "proxy_box_collision",
             "initial_pose_ref": "scene/object_init_poses_metric.json",
             "bbox_m": {
