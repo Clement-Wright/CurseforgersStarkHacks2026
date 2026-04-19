@@ -28,6 +28,8 @@ def test_checked_in_bundle_validates() -> None:
     bundle = validate_bundle(load_bundle(Path("spec")))
 
     assert bundle.project.capture.preroll_seconds == pytest.approx(10.0)
+    assert bundle.project.beta.primary_backbone == "colmap_preroll_localization"
+    assert bundle.project.beta.robot_base_anchor.mode == "measured_fiducial_anchor"
     assert bundle.project.gamma.primary_backbone == "fourdhumans"
     assert bundle.project.delta.primary_backbone == "grounded_sam2"
     assert bundle.project.epsilon.primary_backbone == "artifact_fusion"
@@ -40,6 +42,8 @@ def test_checked_in_bundle_validates() -> None:
     assert bundle.project.eta.retarget_mode == "measured_world_replay"
     assert bundle.project.theta.primary_backbone == "canonical_mujoco_task"
     assert bundle.project.acceptance.theta_require_playback_renders is True
+    assert bundle.project.iota.primary_backbone == "state_first_learning"
+    assert bundle.project.kappa.primary_backbone == "ros2_control_deployment"
     assert bundle.project.ontology.target_object_id == "eraser"
     assert bundle.project.ontology.receptacle_object_id == "toothpaste_box"
     assert bundle.project.ontology.fiducial_board_id == "fiducial_board"
@@ -53,6 +57,8 @@ def test_checked_in_bundle_validates() -> None:
     assert bundle.env_specs["sfm"].name == "video-task-compiler-sfm"
     assert bundle.env_specs["scene"].name == "video-task-compiler-scene"
     assert bundle.env_specs["sim"].name == "video-task-compiler-sim"
+    assert bundle.env_specs["learn"].name == "video-task-compiler-learn"
+    assert bundle.env_specs["deploy"].name == "video-task-compiler-deploy"
 
 
 def test_missing_project_file_reports_targeted_error(tmp_path: Path) -> None:

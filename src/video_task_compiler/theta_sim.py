@@ -992,6 +992,52 @@ def _trace_sample_indices(trace_length: int, sample_count: int) -> np.ndarray:
     return np.unique(np.linspace(0, trace_length - 1, sample_count, dtype=int))
 
 
+def _frame_quality_metrics(frame: np.ndarray) -> dict[str, Any]:
+    frame_array = np.asarray(frame, dtype=float)
+    if frame_array.size == 0:
+        return {
+            "ok": False,
+            "mean_intensity": 0.0,
+            "pixel_std": 0.0,
+            "nearly_black": True,
+            "low_variance": True,
+        }
+    mean_intensity = float(frame_array.mean())
+    pixel_std = float(frame_array.std())
+    nearly_black = mean_intensity < 8.0
+    low_variance = pixel_std < 1.5
+    return {
+        "ok": not nearly_black and not low_variance,
+        "mean_intensity": mean_intensity,
+        "pixel_std": pixel_std,
+        "nearly_black": nearly_black,
+        "low_variance": low_variance,
+    }
+
+
+def _sequence_quality_metrics(frames: Sequence[np.ndarray]) -> dict[str, Any]:
+    if not frames:
+        return {
+            "ok": False,
+            "sample_count": 0,
+            "mean_intensity": 0.0,
+            "pixel_std": 0.0,
+            "nearly_black": True,
+            "low_variance": True,
+        }
+    sample_count = min(5, len(frames))
+    sample_indices = np.unique(np.linspace(0, len(frames) - 1, sample_count, dtype=int))
+    samples = [_frame_quality_metrics(np.asarray(frames[index], dtype=np.uint8)) for index in sample_indices]
+    return {
+        "ok": all(bool(sample["ok"]) for sample in samples),
+        "sample_count": int(len(samples)),
+        "mean_intensity": float(np.mean([sample["mean_intensity"] for sample in samples])),
+        "pixel_std": float(np.mean([sample["pixel_std"] for sample in samples])),
+        "nearly_black": any(bool(sample["nearly_black"]) for sample in samples),
+        "low_variance": any(bool(sample["low_variance"]) for sample in samples),
+    }
+
+
 def _render_placeholder_audit(
     path: Path,
     support_bbox: tuple[np.ndarray, np.ndarray],
@@ -1000,7 +1046,7 @@ def _render_placeholder_audit(
     target_region: dict[str, Any],
     robot_trace: dict[str, np.ndarray],
     human_ghost: dict[str, np.ndarray],
-) -> tuple[bool, str, tuple[int, int]]:
+) -> tuple[bool, str, tuple[int, int], dict[str, Any]]:
     width_px, height_px = 960, 540
     image = Image.new("RGB", (width_px, height_px), color=(245, 245, 245))
     draw = ImageDraw.Draw(image, "RGBA")
@@ -1092,9 +1138,11 @@ def _render_placeholder_audit(
         draw.ellipse((wrist_uv[0] - 4, wrist_uv[1] - 4, wrist_uv[0] + 4, wrist_uv[1] + 4), fill=(220, 30, 30))
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    frame = np.asarray(image, dtype=np.uint8)
+    metrics = _frame_quality_metrics(frame)
     image.save(path)
     image.close()
-    return True, "placeholder_projection", (width_px, height_px)
+    return False, "placeholder_projection", (width_px, height_px), metrics
 
 
 def _render_audit_image(
@@ -1109,7 +1157,7 @@ def _render_audit_image(
     target_region: dict[str, Any],
     robot_trace: dict[str, np.ndarray],
     human_ghost: dict[str, np.ndarray],
-) -> tuple[bool, str, tuple[int, int]]:
+) -> tuple[bool, str, tuple[int, int], dict[str, Any]]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     renderer_cls = getattr(mujoco, "Renderer", None)
     if renderer_cls is None:
@@ -1139,7 +1187,8 @@ def _render_audit_image(
         image = Image.fromarray(np.asarray(rgb, dtype=np.uint8))
         image.save(out_path)
         image.close()
-        return True, "mujoco_renderer", (int(rgb.shape[1]), int(rgb.shape[0]))
+        metrics = _frame_quality_metrics(np.asarray(rgb, dtype=np.uint8))
+        return bool(metrics["ok"]), "mujoco_renderer", (int(rgb.shape[1]), int(rgb.shape[0])), metrics
     except Exception:
         return _render_placeholder_audit(
             out_path,
@@ -1186,6 +1235,7 @@ def _render_playback_videos(
         path = playback_dir / f"{camera_name}.mp4"
         frames: list[np.ndarray] = []
         mode = "mujoco_renderer"
+        render_ok = True
         try:
             renderer = renderer_cls(model, 960, 540)
             try:
@@ -1212,14 +1262,18 @@ def _render_playback_videos(
         except Exception:
             mode = "placeholder_video"
             frames = [np.full((540, 960, 3), 235, dtype=np.uint8) for _ in range(max(1, len(trace_indices)))]
+            render_ok = False
+        quality = _sequence_quality_metrics(frames)
+        render_ok = bool(render_ok and quality["ok"] and mode == "mujoco_renderer")
         imageio.mimsave(path, frames, fps=10)
         results.append(
             {
                 "camera_name": camera_name,
                 "path": _path_string(path),
-                "ok": True,
+                "ok": render_ok,
                 "mode": mode,
                 "frame_count": len(frames),
+                "quality": quality,
             }
         )
     return results
@@ -1234,6 +1288,7 @@ def _compile_and_validate_scene(
     support_bbox: tuple[np.ndarray, np.ndarray],
     zeta_manifest: dict[str, Any],
     object_pose_map: dict[str, dict[str, Any]],
+    robot_base_payload: dict[str, Any],
     robot_base_transform: np.ndarray,
     target_region: dict[str, Any],
     robot_trace: dict[str, np.ndarray],
@@ -1271,7 +1326,7 @@ def _compile_and_validate_scene(
             binary_loader(str(scene_mjb_path))
             mjb_load_ok = True
 
-        audit_ok, audit_mode, audit_resolution = _render_audit_image(
+        audit_ok, audit_mode, audit_resolution, audit_quality = _render_audit_image(
             mujoco,
             model,
             data,
@@ -1309,6 +1364,8 @@ def _compile_and_validate_scene(
     )
     spatial_sanity = {
         "robot_base_identity_ok": not bool(np.allclose(robot_base_transform, np.eye(4, dtype=float), atol=1e-6)),
+        "robot_base_measured_ok": bool(robot_base_payload.get("measured")),
+        "robot_base_registration_method": robot_base_payload.get("registration_method"),
         "runtime_region_resolution": target_region["runtime_region_resolution"],
         "runtime_region_offset_m": target_region["runtime_region_offset_m"],
         "object_extent_ceiling_hits": object_extent_ceiling_hits,
@@ -1322,6 +1379,21 @@ def _compile_and_validate_scene(
         "pick_place_targets_unclipped_ok": not bool(pick_target_diagnostics.get("was_clipped"))
         and not bool(place_target_diagnostics.get("was_clipped"))
         and waypoint_clip_count == 0,
+    }
+    expected_instance_ids = {
+        str(instance.instance_id)
+        for instance in bundle.task.scene_instances
+        if getattr(instance, "role", None) not in {"fiducial", "zone", "support"}
+    }
+    actual_instance_ids = {
+        str(obj.get("instance_id"))
+        for obj in zeta_manifest.get("objects", [])
+        if str(obj.get("instance_id", "")).strip()
+    }
+    instance_contract = {
+        "expected_instance_ids": sorted(expected_instance_ids),
+        "actual_instance_ids": sorted(actual_instance_ids),
+        "count_ok": expected_instance_ids == actual_instance_ids,
     }
 
     validation = {
@@ -1344,10 +1416,12 @@ def _compile_and_validate_scene(
             "ok": audit_ok,
             "path": _path_string(scene_xml_path.parent / "audit_render.png"),
             "mode": audit_mode,
+            "renderer_backed": audit_mode == "mujoco_renderer",
             "resolution_px": {
                 "width": audit_resolution[0],
                 "height": audit_resolution[1],
             },
+            "quality": audit_quality,
         },
         "playback": {
             "robot_trace_frame_count": int(len(robot_trace["t_ns"])),
@@ -1355,9 +1429,14 @@ def _compile_and_validate_scene(
             "robot_ghost_visible": bool("ee_position_m" in robot_trace and len(robot_trace["ee_position_m"]) > 0),
             "human_ghost_visible": bool(_first_valid_human_segment(human_ghost) is not None),
             "renders_ok": all(bool(render.get("ok")) for render in playback_renders),
+            "renderer_backed_renders_ok": all(
+                bool(render.get("ok")) and render.get("mode") == "mujoco_renderer"
+                for render in playback_renders
+            ),
             "renders": playback_renders,
         },
         "spatial_sanity": spatial_sanity,
+        "instance_contract": instance_contract,
     }
     return validation, {
         "audit_ok": audit_ok,
@@ -1477,6 +1556,7 @@ def compile_task_package(
         support_bbox=support_bbox,
         zeta_manifest=zeta_manifest,
         object_pose_map=object_pose_map,
+        robot_base_payload=robot_base_payload,
         robot_base_transform=robot_base_transform,
         target_region=target_region,
         robot_trace=robot_trace,
@@ -1500,12 +1580,15 @@ def compile_task_package(
         "trace_smoke_ok": bool(validation["scene_compile"]["trace_smoke_ok"]),
         "audit_render_ok": bool(validation["audit_render"]["ok"]),
         "playback_renders_ok": bool(validation["playback"]["renders_ok"]),
+        "renderer_backed_renders_ok": bool(validation["playback"]["renderer_backed_renders_ok"]),
         "robot_ghost_visible": bool(validation["playback"]["robot_ghost_visible"]),
         "human_ghost_visible": bool(validation["playback"]["human_ghost_visible"]),
         "robot_base_identity_ok": bool(validation["spatial_sanity"]["robot_base_identity_ok"]),
+        "robot_base_measured_ok": bool(validation["spatial_sanity"]["robot_base_measured_ok"]),
         "object_extents_clip_ceiling_ok": bool(validation["spatial_sanity"]["object_extents_clip_ceiling_ok"]),
         "target_position_registration_ok": bool(validation["spatial_sanity"]["target_position_registration_ok"]),
         "pick_place_targets_unclipped_ok": bool(validation["spatial_sanity"]["pick_place_targets_unclipped_ok"]),
+        "instance_contract_ok": bool(validation["instance_contract"]["count_ok"]),
     }
     (sim_dir / "validation.json").write_text(json.dumps(validation, indent=2) + "\n", encoding="utf-8")
     enforce_theta_acceptance(bundle, validation)

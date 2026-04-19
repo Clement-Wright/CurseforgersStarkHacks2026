@@ -17,7 +17,10 @@ from .specs import (
 )
 from .epsilon_scene import EpsilonSceneError, compile_metric_scene
 from .human_extract import HumanExtractError, extract_monocular_human_motion
+from .iota_data import IotaDataError, build_state_dataset
+from .iota_train import IotaTrainError, finetune_rl_scaffold, train_state_imitation
 from .eta_retarget import EtaRetargetError, retarget_monocular_demonstration
+from .kappa_deploy import KappaDeployError, export_ros2_workspace
 from .object_extract import ObjectExtractError, extract_monocular_objects
 from .theta_sim import ThetaSimError, compile_task_package
 from .video_ingest import VideoIngestError, ingest_monocular_video
@@ -32,6 +35,9 @@ epsilon_app = typer.Typer(help="Run epsilon metric scene compilation pipelines."
 zeta_app = typer.Typer(help="Run zeta MuJoCo assetization pipelines.")
 eta_app = typer.Typer(help="Run eta robot retargeting pipelines.")
 sim_app = typer.Typer(help="Run theta simulator compilation pipelines.")
+data_app = typer.Typer(help="Run iota dataset export pipelines.")
+train_app = typer.Typer(help="Run iota training pipelines.")
+deploy_app = typer.Typer(help="Run kappa deployment export pipelines.")
 app.add_typer(spec_app, name="spec")
 app.add_typer(video_app, name="video")
 app.add_typer(human_app, name="human")
@@ -40,6 +46,9 @@ app.add_typer(epsilon_app, name="epsilon")
 app.add_typer(zeta_app, name="zeta")
 app.add_typer(eta_app, name="eta")
 app.add_typer(sim_app, name="sim")
+app.add_typer(data_app, name="data")
+app.add_typer(train_app, name="train")
+app.add_typer(deploy_app, name="deploy")
 
 
 def _template_dir(template: str) -> Path:
@@ -714,6 +723,222 @@ def compile_task_cli(
         raise typer.Exit(code=1) from exc
 
     typer.echo(f"sim compile-task completed successfully in {out_dir}")
+
+
+@data_app.command("build-dataset")
+def build_dataset_cli(
+    spec_dir: Path = typer.Option(
+        ...,
+        "--spec-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Bundle root or spec/ directory for the validated contract bundle.",
+    ),
+    theta_dir: Path = typer.Option(
+        ...,
+        "--theta-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Artifact root that already contains theta sim/ outputs.",
+    ),
+    out_dir: Path = typer.Option(
+        ...,
+        "--out-dir",
+        file_okay=False,
+        dir_okay=True,
+        writable=True,
+        resolve_path=True,
+        help="Directory that will receive iota data/ artifacts.",
+    ),
+) -> None:
+    """Export a state-first robomimic-style HDF5 dataset from Theta artifacts."""
+    try:
+        bundle = load_bundle(spec_dir)
+        validate_bundle(bundle)
+        build_state_dataset(bundle=bundle, theta_dir=theta_dir, out_dir=out_dir)
+    except SpecValidationError as exc:
+        _print_issues(exc)
+        raise typer.Exit(code=1) from exc
+    except IotaDataError as exc:
+        typer.echo(f"data build-dataset failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"data build-dataset completed successfully in {out_dir}")
+
+
+@train_app.command("imitation")
+def train_imitation_cli(
+    spec_dir: Path = typer.Option(
+        ...,
+        "--spec-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Bundle root or spec/ directory for the validated contract bundle.",
+    ),
+    dataset_dir: Path = typer.Option(
+        ...,
+        "--dataset-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Artifact root that already contains data/demos.hdf5.",
+    ),
+    out_dir: Path = typer.Option(
+        ...,
+        "--out-dir",
+        file_okay=False,
+        dir_okay=True,
+        writable=True,
+        resolve_path=True,
+        help="Directory that will receive iota policies/ and eval/ artifacts.",
+    ),
+) -> None:
+    """Train the lightweight state-only BC baseline from the exported Iota dataset."""
+    try:
+        bundle = load_bundle(spec_dir)
+        validate_bundle(bundle)
+        train_state_imitation(bundle=bundle, dataset_dir=dataset_dir, out_dir=out_dir)
+    except SpecValidationError as exc:
+        _print_issues(exc)
+        raise typer.Exit(code=1) from exc
+    except IotaTrainError as exc:
+        typer.echo(f"train imitation failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"train imitation completed successfully in {out_dir}")
+
+
+@train_app.command("finetune-rl")
+def finetune_rl_cli(
+    spec_dir: Path = typer.Option(
+        ...,
+        "--spec-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Bundle root or spec/ directory for the validated contract bundle.",
+    ),
+    dataset_dir: Path = typer.Option(
+        ...,
+        "--dataset-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Artifact root that already contains data/demos.hdf5.",
+    ),
+    out_dir: Path = typer.Option(
+        ...,
+        "--out-dir",
+        file_okay=False,
+        dir_okay=True,
+        writable=True,
+        resolve_path=True,
+        help="Directory that will receive fine-tuned policy and eval artifacts.",
+    ),
+    imitation_policy: Optional[Path] = typer.Option(
+        None,
+        "--imitation-policy",
+        exists=False,
+        file_okay=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Optional explicit path to an existing BC policy artifact.",
+    ),
+) -> None:
+    """Run the local RL fine-tuning scaffold on top of the BC baseline."""
+    try:
+        bundle = load_bundle(spec_dir)
+        validate_bundle(bundle)
+        finetune_rl_scaffold(
+            bundle=bundle,
+            dataset_dir=dataset_dir,
+            out_dir=out_dir,
+            imitation_policy_path=imitation_policy,
+        )
+    except SpecValidationError as exc:
+        _print_issues(exc)
+        raise typer.Exit(code=1) from exc
+    except IotaTrainError as exc:
+        typer.echo(f"train finetune-rl failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"train finetune-rl completed successfully in {out_dir}")
+
+
+@deploy_app.command("export-ros2")
+def export_ros2_cli(
+    spec_dir: Path = typer.Option(
+        ...,
+        "--spec-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Bundle root or spec/ directory for the validated contract bundle.",
+    ),
+    theta_dir: Path = typer.Option(
+        ...,
+        "--theta-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Artifact root that already contains theta sim/ outputs.",
+    ),
+    out_dir: Path = typer.Option(
+        ...,
+        "--out-dir",
+        file_okay=False,
+        dir_okay=True,
+        writable=True,
+        resolve_path=True,
+        help="Directory that will receive ros2/ export artifacts.",
+    ),
+    policy_path: Optional[Path] = typer.Option(
+        None,
+        "--policy-path",
+        exists=False,
+        file_okay=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Optional path to a trained policy artifact to package with the ROS 2 export.",
+    ),
+) -> None:
+    """Export a ROS 2 deployment workspace scaffold from the Theta task package."""
+    try:
+        bundle = load_bundle(spec_dir)
+        validate_bundle(bundle)
+        export_ros2_workspace(
+            bundle=bundle,
+            theta_dir=theta_dir,
+            out_dir=out_dir,
+            policy_path=policy_path,
+        )
+    except SpecValidationError as exc:
+        _print_issues(exc)
+        raise typer.Exit(code=1) from exc
+    except KappaDeployError as exc:
+        typer.echo(f"deploy export-ros2 failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"deploy export-ros2 completed successfully in {out_dir}")
 
 
 def main() -> None:

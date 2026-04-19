@@ -49,6 +49,14 @@ class BundlePaths:
     env_paths: dict[str, Path]
 
 
+Matrix4x4 = tuple[
+    tuple[float, float, float, float],
+    tuple[float, float, float, float],
+    tuple[float, float, float, float],
+    tuple[float, float, float, float],
+]
+
+
 class Vec3(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -300,6 +308,25 @@ class ProjectCoordFrameSpec(BaseModel):
     camera_optical: str = Field(min_length=1)
 
 
+class ProjectBetaRobotBaseAnchorSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["measured_fiducial_anchor", "legacy_nearest_visible_fiducial"]
+    anchor_kind: Literal["fiducial_board", "single_fiducial"]
+    anchor_board_id: str | None = None
+    anchor_frame: str = Field(min_length=1)
+    allow_legacy_debug_fallback: bool = False
+    X_Br_from_anchor: Matrix4x4 | None = None
+
+
+class ProjectBetaSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    primary_backbone: Literal["colmap_preroll_localization"]
+    static_geometry_source: Literal["registered_preroll_frames"]
+    robot_base_anchor: ProjectBetaRobotBaseAnchorSpec
+
+
 class ProjectOntologyRefsSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -424,6 +451,49 @@ class ProjectThetaSpec(BaseModel):
     human_ghost_mode: Literal["arm_observables"]
 
 
+class ProjectIotaDatasetSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    format: Literal["robomimic_hdf5"]
+    observation_mode: Literal["state_only"]
+    include_next_obs: bool
+
+
+class ProjectIotaImitationSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    algorithm: Literal["linear_bc"]
+    action_representation: Literal["joint_plus_gripper_delta"]
+    evaluation_rollouts: int = Field(ge=1)
+
+
+class ProjectIotaRLSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    algorithm: Literal["sac_stub"]
+    randomized_eval_episodes: int = Field(ge=1)
+
+
+class ProjectIotaSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    primary_backbone: Literal["state_first_learning"]
+    dataset: ProjectIotaDatasetSpec
+    imitation: ProjectIotaImitationSpec
+    rl: ProjectIotaRLSpec
+
+
+class ProjectKappaSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    primary_backbone: Literal["ros2_control_deployment"]
+    control_plane: Literal["ros2_control"]
+    mujoco_parity_backend: Literal["mujoco_ros2_control"]
+    action_abstraction: Literal["cartesian_delta_pose_plus_gripper"]
+    export_layout: Literal["ros2_workspace"]
+    safety_supervisor: Literal["workspace_velocity_timeout_watchdog"]
+
+
 class ProjectSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -440,12 +510,15 @@ class ProjectSpec(BaseModel):
     time: ProjectTimeSpec
     world_frame_policy: Literal["fiducial_center"]
     metric_scale_policy: Literal["fiducial_marker"]
+    beta: ProjectBetaSpec
     gamma: ProjectGammaSpec
     delta: ProjectDeltaSpec
     epsilon: ProjectEpsilonSpec
     zeta: ProjectZetaSpec
     eta: ProjectEtaSpec
     theta: ProjectThetaSpec
+    iota: ProjectIotaSpec
+    kappa: ProjectKappaSpec
     ontology: ProjectOntologyRefsSpec
     sponsor_resources: list[str] = Field(min_length=1)
     acceptance: ProjectAcceptanceSpec
@@ -551,6 +624,8 @@ def resolve_bundle_paths(bundle_or_spec_dir: Path) -> BundlePaths:
             "objects": env_dir / "objects.environment.yml",
             "scene": env_dir / "scene.environment.yml",
             "sim": env_dir / "sim.environment.yml",
+            "learn": env_dir / "learn.environment.yml",
+            "deploy": env_dir / "deploy.environment.yml",
         },
     )
 
@@ -1075,6 +1150,43 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
             )
         )
 
+    if bundle.project.beta.primary_backbone != "colmap_preroll_localization":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "beta.primary_backbone",
+                "beta currently supports only the colmap_preroll_localization backbone",
+            )
+        )
+
+    if bundle.project.beta.static_geometry_source != "registered_preroll_frames":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "beta.static_geometry_source",
+                "beta static geometry must come from registered_preroll_frames",
+            )
+        )
+
+    beta_anchor = bundle.project.beta.robot_base_anchor
+    if beta_anchor.mode == "measured_fiducial_anchor":
+        if beta_anchor.X_Br_from_anchor is None:
+            issues.append(
+                _compat_issue(
+                    bundle.project_path,
+                    "beta.robot_base_anchor.X_Br_from_anchor",
+                    "measured_fiducial_anchor beta runs must provide a measured X_Br_from_anchor transform",
+                )
+            )
+        if not beta_anchor.anchor_board_id:
+            issues.append(
+                _compat_issue(
+                    bundle.project_path,
+                    "beta.robot_base_anchor.anchor_board_id",
+                    "measured_fiducial_anchor beta runs must identify the anchor board or fiducial",
+                )
+            )
+
     if bundle.project.gamma.primary_backbone != "fourdhumans":
         issues.append(
             _compat_issue(
@@ -1262,6 +1374,18 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
                 "eta retarget_mode must be planar_pick_place or measured_world_replay",
             )
         )
+    elif (
+        bundle.project.eta.retarget_mode == "measured_world_replay"
+        and bundle.project.beta.robot_base_anchor.mode != "measured_fiducial_anchor"
+        and not bundle.project.beta.robot_base_anchor.allow_legacy_debug_fallback
+    ):
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "eta.retarget_mode",
+                "measured_world_replay eta runs require beta.robot_base_anchor.mode=measured_fiducial_anchor unless legacy debug fallback is explicitly allowed",
+            )
+        )
 
     if bundle.project.eta.ik_backend != "pinocchio_seed":
         issues.append(
@@ -1314,6 +1438,78 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
                 bundle.project_path,
                 "theta.human_ghost_mode",
                 "theta currently supports only arm_observables human ghost playback",
+            )
+        )
+
+    if bundle.project.iota.primary_backbone != "state_first_learning":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "iota.primary_backbone",
+                "iota currently supports only the state_first_learning backbone",
+            )
+        )
+
+    if bundle.project.iota.dataset.format != "robomimic_hdf5":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "iota.dataset.format",
+                "iota dataset export must currently target robomimic_hdf5",
+            )
+        )
+
+    if bundle.project.iota.dataset.observation_mode != "state_only":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "iota.dataset.observation_mode",
+                "iota currently supports only state_only observations",
+            )
+        )
+
+    if bundle.project.iota.imitation.algorithm != "linear_bc":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "iota.imitation.algorithm",
+                "iota currently supports only the lightweight linear_bc imitation baseline",
+            )
+        )
+
+    if bundle.project.iota.rl.algorithm != "sac_stub":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "iota.rl.algorithm",
+                "iota currently supports only the local sac_stub RL fine-tuning scaffold",
+            )
+        )
+
+    if bundle.project.kappa.primary_backbone != "ros2_control_deployment":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "kappa.primary_backbone",
+                "kappa currently supports only the ros2_control_deployment backbone",
+            )
+        )
+
+    if bundle.project.kappa.control_plane != "ros2_control":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "kappa.control_plane",
+                "kappa currently requires ros2_control as the deployment control plane",
+            )
+        )
+
+    if bundle.project.kappa.mujoco_parity_backend != "mujoco_ros2_control":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "kappa.mujoco_parity_backend",
+                "kappa currently requires mujoco_ros2_control for sim/hardware parity metadata",
             )
         )
 

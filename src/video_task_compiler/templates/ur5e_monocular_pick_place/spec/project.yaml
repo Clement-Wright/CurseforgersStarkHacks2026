@@ -29,6 +29,20 @@ time:
   base_unit: ns
 world_frame_policy: fiducial_center
 metric_scale_policy: fiducial_marker
+beta:
+  primary_backbone: colmap_preroll_localization
+  static_geometry_source: registered_preroll_frames
+  robot_base_anchor:
+    mode: measured_fiducial_anchor
+    anchor_kind: fiducial_board
+    anchor_board_id: fiducial_board
+    anchor_frame: Ft
+    allow_legacy_debug_fallback: false
+    X_Br_from_anchor:
+      - [0.0, -1.0, 0.0, 0.18]
+      - [1.0, 0.0, 0.0, -0.34]
+      - [0.0, 0.0, 1.0, 0.0]
+      - [0.0, 0.0, 0.0, 1.0]
 gamma:
   primary_backbone: fourdhumans
   export_world_estimates_when_available: true
@@ -77,6 +91,26 @@ theta:
   sim_world_frame: M
   robot_model_source: vendored_local_copy
   human_ghost_mode: arm_observables
+iota:
+  primary_backbone: state_first_learning
+  dataset:
+    format: robomimic_hdf5
+    observation_mode: state_only
+    include_next_obs: true
+  imitation:
+    algorithm: linear_bc
+    action_representation: joint_plus_gripper_delta
+    evaluation_rollouts: 8
+  rl:
+    algorithm: sac_stub
+    randomized_eval_episodes: 8
+kappa:
+  primary_backbone: ros2_control_deployment
+  control_plane: ros2_control
+  mujoco_parity_backend: mujoco_ros2_control
+  action_abstraction: cartesian_delta_pose_plus_gripper
+  export_layout: ros2_workspace
+  safety_supervisor: workspace_velocity_timeout_watchdog
 ontology:
   target_object_id: eraser
   receptacle_object_id: toothpaste_box

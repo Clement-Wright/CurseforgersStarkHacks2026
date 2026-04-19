@@ -1,0 +1,9 @@
+name: video-task-compiler-learn
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy
+  - h5py
+  - pyyaml
+  - typer

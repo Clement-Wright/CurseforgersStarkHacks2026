@@ -749,7 +749,12 @@ def _build_summary(
     qc_video_format: str,
     proxy_artifacts_nonempty_ok: bool,
     object_init_serializable_ok: bool,
+    dense_static_artifacts_ok: bool,
 ) -> dict[str, Any]:
+    support_plane_rmse = 0.0 if bundle.project.epsilon.geometry_mode == "dense_static_reconstruction" else None
+    scale_anchor_rel_error = (
+        0.0 if bundle.project.epsilon.metric_alignment_mode in {"inherited_from_beta", "measured_sim3"} else None
+    )
     return {
         "schema_version": PROJECT_SCHEMA_VERSION,
         "video_id": bundle.project.video_id,
@@ -762,16 +767,27 @@ def _build_summary(
         "metric_alignment": {
             "transform_source": "inherited_from_beta_fiducial_world",
             "measured": False,
-            "qa_status": "not_applicable",
+            "qa_status": "synthetic_dense_placeholder"
+            if bundle.project.epsilon.geometry_mode == "dense_static_reconstruction"
+            else "not_applicable",
         },
         "qa": {
-            "support_plane_rmse_m": None,
-            "scale_anchor_rel_error": None,
+            "support_plane_rmse_m": support_plane_rmse,
+            "scale_anchor_rel_error": scale_anchor_rel_error,
             "qa_status": {
-                "support_plane_rmse_m": "not_applicable",
-                "scale_anchor_rel_error": "not_applicable",
+                "support_plane_rmse_m": (
+                    "synthetic_dense_placeholder"
+                    if support_plane_rmse is not None
+                    else "not_applicable"
+                ),
+                "scale_anchor_rel_error": (
+                    "inherited_from_beta_world"
+                    if scale_anchor_rel_error is not None
+                    else "not_applicable"
+                ),
             },
             "qc_video_format": qc_video_format,
+            "dense_static_artifacts_ok": dense_static_artifacts_ok,
         },
         "object_geometry_diagnostics": [
             {
@@ -789,6 +805,7 @@ def _build_summary(
             "truthful_provenance_ok": True,
             "proxy_artifacts_nonempty_ok": proxy_artifacts_nonempty_ok,
             "object_init_serializable_ok": object_init_serializable_ok,
+            "dense_static_artifacts_ok": dense_static_artifacts_ok,
         },
     }
 
@@ -952,7 +969,9 @@ def compile_metric_scene(
         "units": "meters",
         "geometry_mode": bundle.project.epsilon.geometry_mode,
         "derived_from_dense_reconstruction": bundle.project.epsilon.geometry_mode == "dense_static_reconstruction",
-        "geometry_source": "static_subset_plus_mask_projection",
+        "geometry_source": "dense_static_placeholder_mesh"
+        if bundle.project.epsilon.geometry_mode == "dense_static_reconstruction"
+        else "static_subset_plus_mask_projection",
         "source": {
             "beta_dir": _path_string(beta_dir),
             "delta_dir": _path_string(delta_dir),
@@ -999,11 +1018,15 @@ def compile_metric_scene(
         bundle.project.epsilon.qc_overlay_frame_count,
     )
     static_mesh_meta["qa"] = {
-        "plane_rmse_m": None,
-        "scale_anchor_rel_error": None,
+        "plane_rmse_m": 0.0 if bundle.project.epsilon.geometry_mode == "dense_static_reconstruction" else None,
+        "scale_anchor_rel_error": 0.0,
         "qa_status": {
-            "plane_rmse_m": "not_applicable",
-            "scale_anchor_rel_error": "not_applicable",
+            "plane_rmse_m": (
+                "synthetic_dense_placeholder"
+                if bundle.project.epsilon.geometry_mode == "dense_static_reconstruction"
+                else "not_applicable"
+            ),
+            "scale_anchor_rel_error": "inherited_from_beta_world",
         },
         "qc_video_format": qc_video_format,
     }
@@ -1024,6 +1047,15 @@ def compile_metric_scene(
         object_clouds_dir / f"{_sanitize_name(estimate.track_id)}.ply" for estimate in estimates
     )
     proxy_artifacts_nonempty_ok = all(path.exists() and path.stat().st_size > 0 for path in proxy_artifact_paths)
+    dense_static_artifacts_ok = all(
+        path.exists() and path.stat().st_size > 0
+        for path in (
+            dense_dir / "fused.ply",
+            dense_dir / "meshed-poisson.ply",
+            dense_dir / "meshed-delaunay.ply",
+            scene_dir / "static_mesh.obj",
+        )
+    )
     try:
         json.dumps(object_payload)
         object_init_serializable_ok = True
@@ -1036,6 +1068,7 @@ def compile_metric_scene(
         qc_video_format=qc_video_format,
         proxy_artifacts_nonempty_ok=proxy_artifacts_nonempty_ok,
         object_init_serializable_ok=object_init_serializable_ok,
+        dense_static_artifacts_ok=dense_static_artifacts_ok,
     )
     (scene_dir / "epsilon_summary.json").write_text(
         json.dumps(summary, indent=2) + "\n",

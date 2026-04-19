@@ -32,6 +32,8 @@ from video_task_compiler.video_ingest import (
     timestamp_seconds_from_pts,
     assign_frame_segments,
     build_pose_timeline,
+    write_robot_base_in_metric_world_json,
+    write_static_geometry_subset_json,
 )
 from video_task_compiler.specs import load_bundle, validate_bundle
 
@@ -506,3 +508,60 @@ def test_run_colmap_pipeline_extracts_preroll_before_localization(
 def test_colmap_and_pyav_smoke() -> None:
     result = subprocess.run(["colmap", "help"], capture_output=True, text=True)
     assert result.returncode == 0
+
+
+def test_write_robot_base_anchor_and_static_subset_contracts(tmp_path: Path) -> None:
+    bundle = validate_bundle(load_bundle(Path("spec")))
+    detections = [
+        FiducialDetection(
+            frame_name="frame_000000.png",
+            marker_id=7,
+            rotation_tc=np.eye(3, dtype=float),
+            translation_tc=np.array([0.08, -0.03, 0.55], dtype=float),
+        ),
+        FiducialDetection(
+            frame_name="frame_000001.png",
+            marker_id=7,
+            rotation_tc=np.eye(3, dtype=float),
+            translation_tc=np.array([0.10, -0.02, 0.52], dtype=float),
+        ),
+    ]
+    records = [
+        FrameRecord(
+            index,
+            f"frame_{index:06d}.png",
+            index * 10,
+            float(index) * 0.5,
+            index * 500_000_000,
+            tmp_path / f"frame_{index:06d}.png",
+            segment="preroll",
+            is_keyframe=(index == 0),
+            registered=True,
+            pose_status="registered",
+        )
+        for index in range(2)
+    ]
+
+    payload = write_robot_base_in_metric_world_json(
+        tmp_path / "robot_base_in_metric_world.json",
+        bundle,
+        detections,
+    )
+    static_subset = write_static_geometry_subset_json(
+        tmp_path / "static_geometry_subset.json",
+        bundle,
+        records,
+    )
+
+    assert payload["registration_method"] == "measured_fiducial_anchor"
+    assert payload["measured"] is True
+    assert payload["anchor_kind"] == "fiducial_board"
+    assert payload["anchor_board_id"] == "fiducial_board"
+    assert payload["anchor_frame"] == "Ft"
+    assert payload["legacy_debug_fallback_used"] is False
+    assert np.asarray(payload["X_Br_from_anchor"], dtype=float).shape == (4, 4)
+    assert np.asarray(payload["X_Br_from_M"], dtype=float).shape == (4, 4)
+    assert payload["quality"]["visible_observation_count"] == 2
+    assert static_subset["selection_policy"] == "registered_preroll_frames"
+    assert static_subset["keyframe_frame_indices"] == [0]
+    assert len(static_subset["frames"]) == 2

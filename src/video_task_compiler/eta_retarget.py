@@ -746,12 +746,24 @@ def retarget_monocular_demonstration(
     beta_base_path = beta_dir / "camera" / "robot_base_in_metric_world.json" if beta_dir is not None else None
     if beta_base_path is not None and beta_base_path.exists():
         beta_base_payload = _load_json(beta_base_path)
+        measured_base = bool(beta_base_payload.get("measured"))
+        allow_legacy_debug = bool(bundle.project.beta.robot_base_anchor.allow_legacy_debug_fallback)
+        if bundle.project.eta.retarget_mode == "measured_world_replay" and not measured_base and not allow_legacy_debug:
+            raise EtaRetargetError(
+                "eta measured_world_replay requires a measured beta robot_base_in_metric_world.json; "
+                "legacy nearest-visible-fiducial fallback is disabled for this bundle"
+            )
         robot_base_transform = np.asarray(beta_base_payload["X_Br_from_M"], dtype=float)
         base_registration = dict(beta_base_payload)
         base_registration.setdefault("registration_method", "nearest_visible_fiducial_proxy")
         base_registration["source_artifact"] = _path_string(beta_base_path)
         base_registration["consumed_by_eta"] = True
     else:
+        if bundle.project.eta.retarget_mode == "measured_world_replay":
+            raise EtaRetargetError(
+                "eta measured_world_replay requires beta/camera/robot_base_in_metric_world.json; "
+                "refusing to fall back to proxy base fitting"
+            )
         robot_base_transform, base_registration = _fit_robot_base_transform(bundle, waypoints, support_bbox)
 
     retarget_dir = out_dir / "retarget"

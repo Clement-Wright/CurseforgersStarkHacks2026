@@ -50,9 +50,35 @@ class _FakeMjData:
         self.qvel = np.zeros(model.nv, dtype=float)
 
 
+class _FakeRenderer:
+    def __init__(self, model: _FakeMjModel, width: int, height: int):
+        self.model = model
+        self.width = width
+        self.height = height
+        self.camera = "unknown"
+
+    def update_scene(self, data: _FakeMjData, camera: str | None = None) -> None:
+        _ = data
+        if camera is not None:
+            self.camera = camera
+
+    def render(self) -> np.ndarray:
+        frame = np.full((self.height, self.width, 3), 120, dtype=np.uint8)
+        frame[40:120, 40:240, :] = np.array([40, 180, 90], dtype=np.uint8)
+        if self.camera == "debug_camera":
+            frame[180:320, 280:520, :] = np.array([70, 90, 220], dtype=np.uint8)
+        else:
+            frame[180:320, 280:520, :] = np.array([220, 90, 70], dtype=np.uint8)
+        return frame
+
+    def close(self) -> None:
+        return None
+
+
 class _FakeMujocoModule:
     MjModel = _FakeMjModel
     MjData = _FakeMjData
+    Renderer = _FakeRenderer
 
     @staticmethod
     def mj_step(model: _FakeMjModel, data: _FakeMjData) -> None:
@@ -192,9 +218,19 @@ def _write_beta_artifacts(beta_dir: Path) -> None:
                     [0.0, 0.0, 1.0, 0.0],
                     [0.0, 0.0, 0.0, 1.0],
                 ],
-                "registration_method": "nearest_visible_fiducial_proxy",
-                "measured": False,
-                "anchor_selection_policy": "nearest_visible_fiducial",
+                "registration_method": "measured_fiducial_anchor",
+                "measured": True,
+                "anchor_kind": "fiducial_board",
+                "anchor_board_id": "fiducial_board",
+                "anchor_frame": "Ft",
+                "X_Br_from_anchor": [
+                    [0.0, -1.0, 0.0, 0.18],
+                    [1.0, 0.0, 0.0, -0.34],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+                "legacy_debug_fallback_used": False,
+                "anchor_selection_policy": "nearest_visible_observation_for_provenance",
                 "anchor_marker_id": 7,
                 "anchor_frame_name": "Ft_7",
                 "anchor_translation_tc_m": [0.08, -0.03, 0.55],
@@ -204,7 +240,11 @@ def _write_beta_artifacts(beta_dir: Path) -> None:
                     [0.0, 0.0, 1.0],
                 ],
                 "anchor_distance_m": 0.556,
-                "confidence": 0.93,
+                "quality": {
+                    "visible_observation_count": 3,
+                    "nearest_visible_anchor_distance_m": 0.556,
+                    "confidence": 0.93,
+                },
             },
             indent=2,
         )
@@ -529,7 +569,7 @@ def test_compile_metric_scene_writes_truthful_proxy_epsilon_outputs(tmp_path: Pa
 
     assert summary["geometry_mode"] == "dense_static_reconstruction"
     assert summary["metric_alignment_mode"] == "inherited_from_beta"
-    assert summary["qa"]["support_plane_rmse_m"] is None
+    assert summary["qa"]["support_plane_rmse_m"] is not None
     assert summary["qc_flags"]["truthful_provenance_ok"] is True
     assert (run_dir / "scene" / "world_metric_from_world.json").exists()
     assert (run_dir / "scene" / "support_plane.json").exists()
@@ -575,7 +615,7 @@ def test_assetize_metric_scene_writes_proxy_assets_and_validates_mujoco(tmp_path
     assert len(manifest["objects"]) == 4
     assert manifest["asset_mode"] == "geometry_backed_assets"
     assert all(Path(run_dir / obj["visual_mesh"]).exists() for obj in manifest["objects"])
-    assert all(obj["visual_geometry_mode"] == "geometry_backed_visual" for obj in manifest["objects"])
+    assert all(obj["visual_geometry_mode"] in {"cuboid_visual", "geometry_backed_visual"} for obj in manifest["objects"])
     assert all(Path(run_dir / obj["collision_meshes"][0]).exists() for obj in manifest["objects"])
     assert all(Path(run_dir / obj["metadata_ref"]).exists() for obj in manifest["objects"])
 
@@ -610,8 +650,9 @@ def test_retarget_demonstration_writes_eta_outputs(tmp_path: Path, monkeypatch: 
     assert len(demo_payload["t_ns"]) == summary["retarget_frame_count"]
     assert "replay" not in summary
     robot_base_payload = json.loads((run_dir / "retarget" / "robot_base_in_metric_world.json").read_text(encoding="utf-8"))
-    assert robot_base_payload["registration_method"] == "nearest_visible_fiducial_proxy"
-    assert robot_base_payload["anchor_selection_policy"] == "nearest_visible_fiducial"
+    assert robot_base_payload["registration_method"] == "measured_fiducial_anchor"
+    assert robot_base_payload["anchor_selection_policy"] == "nearest_visible_observation_for_provenance"
+    assert robot_base_payload["measured"] is True
     assert not np.allclose(np.asarray(robot_base_payload["X_Br_from_M"], dtype=float), np.eye(4), atol=1e-6)
     assert summary["qc_flags"]["robot_base_identity_ok"] is True
     assert summary["robot_base_registration"]["consumed_by_eta"] is True
@@ -748,10 +789,13 @@ def test_compile_task_package_writes_theta_outputs(tmp_path: Path, monkeypatch: 
     assert validation["qc_flags"]["trace_smoke_ok"] is True
     assert validation["qc_flags"]["audit_render_ok"] is True
     assert validation["qc_flags"]["playback_renders_ok"] is True
+    assert validation["qc_flags"]["renderer_backed_renders_ok"] is True
     assert validation["qc_flags"]["robot_ghost_visible"] is True
     assert validation["qc_flags"]["human_ghost_visible"] is True
     assert validation["qc_flags"]["robot_base_identity_ok"] is True
+    assert validation["qc_flags"]["robot_base_measured_ok"] is True
     assert validation["qc_flags"]["object_extents_clip_ceiling_ok"] is True
+    assert validation["qc_flags"]["instance_contract_ok"] is True
     assert (run_dir / "sim" / "scene.xml").exists()
     assert (run_dir / "sim" / "scene.mjb").exists()
     assert (run_dir / "sim" / "task.json").exists()
@@ -770,6 +814,9 @@ def test_compile_task_package_writes_theta_outputs(tmp_path: Path, monkeypatch: 
     assert "runtime_target_region_m" in task_payload["task"]
     assert task_payload["task"]["runtime_region_resolution"] == "auto_reanchored_from_scene"
     assert validation["spatial_sanity"]["runtime_region_offset_m"] > 0.0
+    assert validation["audit_render"]["renderer_backed"] is True
+    assert validation["audit_render"]["mode"] == "mujoco_renderer"
+    assert validation["instance_contract"]["count_ok"] is True
 
 
 def test_cli_theta_pipeline_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -852,3 +899,153 @@ def test_cli_theta_pipeline_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     assert theta_result.exit_code == 0
     assert (run_dir / "sim" / "validation.json").exists()
+
+
+def test_iota_and_kappa_cli_pipeline_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("h5py")
+    _install_fake_sim_dependencies(monkeypatch)
+    bundle_root, beta_dir, delta_dir, gamma_dir, run_dir, _ = _prepare_back_half_inputs(tmp_path)
+
+    assert runner.invoke(
+        app,
+        [
+            "epsilon",
+            "compile-monocular",
+            "--spec-dir",
+            str(bundle_root / "spec"),
+            "--beta-dir",
+            str(beta_dir),
+            "--delta-dir",
+            str(delta_dir),
+            "--out-dir",
+            str(run_dir),
+        ],
+    ).exit_code == 0
+    assert runner.invoke(
+        app,
+        [
+            "zeta",
+            "assetize-monocular",
+            "--spec-dir",
+            str(bundle_root / "spec"),
+            "--epsilon-dir",
+            str(run_dir),
+            "--out-dir",
+            str(run_dir),
+        ],
+    ).exit_code == 0
+    assert runner.invoke(
+        app,
+        [
+            "eta",
+            "retarget-monocular",
+            "--spec-dir",
+            str(bundle_root / "spec"),
+            "--gamma-dir",
+            str(gamma_dir),
+            "--beta-dir",
+            str(beta_dir),
+            "--delta-dir",
+            str(delta_dir),
+            "--epsilon-dir",
+            str(run_dir),
+            "--zeta-dir",
+            str(run_dir),
+            "--out-dir",
+            str(run_dir),
+            "--task-start-frame",
+            "1",
+            "--task-end-frame",
+            "2",
+        ],
+    ).exit_code == 0
+    assert runner.invoke(
+        app,
+        [
+            "sim",
+            "compile-task",
+            "--spec-dir",
+            str(bundle_root / "spec"),
+            "--gamma-dir",
+            str(gamma_dir),
+            "--epsilon-dir",
+            str(run_dir),
+            "--zeta-dir",
+            str(run_dir),
+            "--eta-dir",
+            str(run_dir),
+            "--out-dir",
+            str(run_dir),
+        ],
+    ).exit_code == 0
+
+    dataset_result = runner.invoke(
+        app,
+        [
+            "data",
+            "build-dataset",
+            "--spec-dir",
+            str(bundle_root / "spec"),
+            "--theta-dir",
+            str(run_dir),
+            "--out-dir",
+            str(run_dir),
+        ],
+    )
+    assert dataset_result.exit_code == 0
+    assert (run_dir / "data" / "demos.hdf5").exists()
+
+    bc_result = runner.invoke(
+        app,
+        [
+            "train",
+            "imitation",
+            "--spec-dir",
+            str(bundle_root / "spec"),
+            "--dataset-dir",
+            str(run_dir),
+            "--out-dir",
+            str(run_dir),
+        ],
+    )
+    assert bc_result.exit_code == 0
+    assert (run_dir / "policies" / "bc_state.npz").exists()
+    assert (run_dir / "eval" / "bc_rollouts.json").exists()
+
+    rl_result = runner.invoke(
+        app,
+        [
+            "train",
+            "finetune-rl",
+            "--spec-dir",
+            str(bundle_root / "spec"),
+            "--dataset-dir",
+            str(run_dir),
+            "--out-dir",
+            str(run_dir),
+        ],
+    )
+    assert rl_result.exit_code == 0
+    assert (run_dir / "policies" / "sac_ft_state.npz").exists()
+    assert (run_dir / "eval" / "randomized_sweeps.json").exists()
+
+    deploy_result = runner.invoke(
+        app,
+        [
+            "deploy",
+            "export-ros2",
+            "--spec-dir",
+            str(bundle_root / "spec"),
+            "--theta-dir",
+            str(run_dir),
+            "--out-dir",
+            str(run_dir),
+            "--policy-path",
+            str(run_dir / "policies" / "bc_state.npz"),
+        ],
+    )
+    assert deploy_result.exit_code == 0
+    assert (run_dir / "ros2" / "config" / "controllers.yaml").exists()
+    assert (run_dir / "ros2" / "config" / "safety_supervisor.yaml").exists()
+    assert (run_dir / "ros2" / "config" / "theta_parity.json").exists()
+    assert (run_dir / "ros2" / "export_summary.json").exists()

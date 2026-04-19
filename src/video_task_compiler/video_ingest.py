@@ -1305,28 +1305,53 @@ def write_robot_base_in_metric_world_json(
 ) -> dict[str, Any]:
     anchor = _nearest_visible_fiducial(detections)
     anchor_translation = np.asarray(anchor.translation_tc, dtype=float)
-    base_translation = anchor_translation + np.array([0.0, -0.55, 0.0], dtype=float)
-    base_translation[2] = 0.0
-    transform = np.eye(4, dtype=float)
-    transform[:3, :3] = _rotation_z(math.pi / 2.0)
-    transform[:3, 3] = base_translation
     anchor_distance = float(np.linalg.norm(anchor_translation))
-    payload = {
+    anchor_contract = bundle.project.beta.robot_base_anchor
+    payload: dict[str, Any] = {
         "schema_version": PROJECT_SCHEMA_VERSION,
         "video_id": bundle.project.video_id,
         "source_world": bundle.project.coord_frames.project_world,
         "target_frame": bundle.robot.base_frame,
-        "X_Br_from_M": transform.tolist(),
-        "registration_method": "nearest_visible_fiducial_proxy",
-        "measured": False,
-        "anchor_selection_policy": "nearest_visible_fiducial",
+        "anchor_kind": anchor_contract.anchor_kind,
+        "anchor_board_id": anchor_contract.anchor_board_id,
+        "anchor_frame": anchor_contract.anchor_frame,
+        "anchor_selection_policy": "nearest_visible_observation_for_provenance",
         "anchor_marker_id": int(anchor.marker_id),
         "anchor_frame_name": anchor.frame_name,
         "anchor_translation_tc_m": anchor_translation.tolist(),
         "anchor_rotation_tc": np.asarray(anchor.rotation_tc, dtype=float).tolist(),
         "anchor_distance_m": anchor_distance,
-        "confidence": float(1.0 / (1.0 + anchor_distance)),
+        "quality": {
+            "visible_observation_count": int(len(detections)),
+            "nearest_visible_anchor_distance_m": anchor_distance,
+            "confidence": float(1.0 / (1.0 + anchor_distance)),
+        },
     }
+    if anchor_contract.mode == "measured_fiducial_anchor":
+        transform = np.asarray(anchor_contract.X_Br_from_anchor, dtype=float)
+        payload.update(
+            {
+                "registration_method": "measured_fiducial_anchor",
+                "measured": True,
+                "legacy_debug_fallback_used": False,
+                "X_Br_from_anchor": transform.tolist(),
+                "X_Br_from_M": transform.tolist(),
+            }
+        )
+    else:
+        base_translation = anchor_translation + np.array([0.0, -0.55, 0.0], dtype=float)
+        base_translation[2] = 0.0
+        transform = np.eye(4, dtype=float)
+        transform[:3, :3] = _rotation_z(math.pi / 2.0)
+        transform[:3, 3] = base_translation
+        payload.update(
+            {
+                "registration_method": "nearest_visible_fiducial_proxy",
+                "measured": False,
+                "legacy_debug_fallback_used": True,
+                "X_Br_from_M": transform.tolist(),
+            }
+        )
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return payload
 

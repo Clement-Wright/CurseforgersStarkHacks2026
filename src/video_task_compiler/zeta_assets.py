@@ -312,8 +312,16 @@ def assetize_metric_scene(
         "static": {
             "visual_mesh": "assets/static_visual.obj",
             "collision_meshes": ["assets/static_collision_00.obj"],
-            "source_kind": "proxy_scene_mesh",
-            "visual_geometry_mode": scene_meta.get("geometry_mode", "proxy_scene"),
+            "source_kind": (
+                "dense_mesh_visual"
+                if scene_meta.get("geometry_mode") == "dense_static_reconstruction"
+                else "proxy_scene_mesh"
+            ),
+            "visual_geometry_mode": (
+                "dense_mesh_visual"
+                if scene_meta.get("geometry_mode") == "dense_static_reconstruction"
+                else scene_meta.get("geometry_mode", "proxy_scene")
+            ),
             "collision_geometry_mode": "primitive_box",
             "initial_pose_ref": "scene/static_mesh.meta.json",
             "bbox_m": {
@@ -356,10 +364,14 @@ def assetize_metric_scene(
             "collision_meshes": [f"assets/{collision_path.name}"],
             "collision_geom_count": 1,
             "source_kind": obj.get("geometry_source", "proxy_box_asset"),
-            "visual_geometry_mode": "geometry_backed_visual"
-            if source_mesh_rel
-            else "proxy_box_visual",
-            "collision_geometry_mode": "proxy_box_collision",
+            "visual_geometry_mode": (
+                "cuboid_visual"
+                if obj.get("geometry_source") == "mask_backprojected_cuboid"
+                else "geometry_backed_visual"
+                if source_mesh_rel
+                else "fallback_proxy_visual"
+            ),
+            "collision_geometry_mode": "single_obb_collision",
             "initial_pose_ref": "scene/object_init_poses_metric.json",
             "bbox_m": {
                 "min": bbox_min,
