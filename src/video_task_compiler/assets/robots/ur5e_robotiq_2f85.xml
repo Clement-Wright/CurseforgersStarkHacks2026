@@ -1,0 +1,60 @@
+<mujoco model="ur5e_robotiq_2f85_vendored">
+  <compiler angle="radian" coordinate="local" autolimits="true"/>
+  <option timestep="0.002" gravity="0 0 -9.81"/>
+  <visual>
+    <map znear="0.01"/>
+    <headlight ambient="0.25 0.25 0.25" diffuse="0.6 0.6 0.6" specular="0.1 0.1 0.1"/>
+  </visual>
+  <default>
+    <joint limited="true" damping="1.0" armature="0.01"/>
+    <geom type="capsule" size="0.03" density="300" rgba="0.22 0.22 0.25 1" contype="0" conaffinity="0"/>
+    <default class="finger">
+      <joint type="slide" limited="true" damping="0.2" range="0 0.0425"/>
+      <geom type="box" size="0.004 0.01 0.04" density="200" rgba="0.1 0.1 0.1 1" contype="0" conaffinity="0"/>
+    </default>
+  </default>
+  <worldbody>
+    <body name="base_link" pos="0 0 0">
+      <geom type="cylinder" size="0.06 0.03" density="500" rgba="0.18 0.18 0.2 1" contype="0" conaffinity="0"/>
+      <body name="shoulder_pan_link" pos="0 0 0.03">
+        <joint name="shoulder_pan_joint" axis="0 0 1" range="-6.283 6.283"/>
+        <geom fromto="0 0 0 0 0 0.1325" size="0.05"/>
+        <body name="shoulder_lift_link" pos="0 0 0.1325">
+          <joint name="shoulder_lift_joint" axis="0 1 0" range="-6.283 6.283"/>
+          <geom fromto="0 0 0 0.425 0 0" size="0.04"/>
+          <body name="elbow_link" pos="0.425 0 0">
+            <joint name="elbow_joint" axis="0 1 0" range="-6.283 6.283"/>
+            <geom fromto="0 0 0 0.3922 0 0" size="0.035"/>
+            <body name="wrist_1_link" pos="0.3922 0 0">
+              <joint name="wrist_1_joint" axis="0 1 0" range="-6.283 6.283"/>
+              <geom fromto="0 0 0 0 0 0.1093" size="0.03"/>
+              <body name="wrist_2_link" pos="0 0 0.1093">
+                <joint name="wrist_2_joint" axis="1 0 0" range="-6.283 6.283"/>
+                <geom fromto="0 0 0 0 0 0.09475" size="0.028"/>
+                <body name="wrist_3_link" pos="0 0 0.09475">
+                  <joint name="wrist_3_joint" axis="0 1 0" range="-6.283 6.283"/>
+                  <geom fromto="0 0 0 0 0 0.0823" size="0.026"/>
+                  <body name="tool0" pos="0 0 0.0823">
+                    <geom type="box" size="0.025 0.03 0.02" density="250" rgba="0.12 0.12 0.12 1" contype="0" conaffinity="0"/>
+                    <site name="tool0_site" pos="0 0 0.08" size="0.01" rgba="0.0 0.7 1.0 1"/>
+                    <body name="left_finger" pos="0 0.018 0.04" childclass="finger">
+                      <joint name="left_finger_slide" axis="0 1 0" range="0 0.0245"/>
+                      <geom/>
+                    </body>
+                    <body name="right_finger" pos="0 -0.018 0.04" childclass="finger">
+                      <joint name="right_finger_slide" axis="0 -1 0" range="0 0.0245"/>
+                      <geom/>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <equality>
+    <joint joint1="right_finger_slide" joint2="left_finger_slide" polycoef="0 1 0 0 0"/>
+  </equality>
+</mujoco>

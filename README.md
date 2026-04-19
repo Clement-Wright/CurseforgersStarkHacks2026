@@ -9,28 +9,36 @@ profile:
 - Operator flow: `prompted_semi_automatic`
 - Metric scale recovery: `fiducial`
 
-Alpha now freezes the deterministic project contract. Beta decodes raw monocular
+Alpha freezes the deterministic project contract. Beta decodes raw monocular
 video with PyAV, uses the static pre-roll as the source of truth for COLMAP
 reconstruction, localizes later frames against that frozen model, normalizes the
 result into a fiducial-aligned metric world frame, and preserves canonical
-COLMAP artifacts by default. Gamma runs 4DHumans over beta’s extracted frames,
+COLMAP artifacts by default. Gamma runs 4DHumans over beta's extracted frames,
 selects one primary demonstrator track, preserves the native tracklets, and
 exports a flat arm-observables layer for downstream robotics code. Delta adds a
 local Grounded-SAM-2 object layer that produces stable ontology-scoped masks,
 tracks, interaction candidates, and review overlays.
 
-## What is included
+Epsilon, Zeta, Eta, and Theta now exist as **experimental MVP back-half
+phases**. They preserve honest proxy-scene provenance, emit compile-validated
+MuJoCo asset packages, export a narrow arm+gripper replay trace, and compile a
+canonical robot-in-scene MuJoCo task package, but they do **not** yet claim
+research-grade dense static reconstruction, learning, or deployment.
+
+## What Is Included
 
 - A Python package in `src/video_task_compiler/`
 - A `vtc` CLI with `spec init`, `spec validate`, and `spec schema`
 - A `vtc video ingest-monocular` beta pipeline command
 - A `vtc human extract-monocular` gamma pipeline command
 - A `vtc objects extract-monocular` delta pipeline command
+- Experimental `vtc epsilon compile-monocular`, `vtc zeta assetize-monocular`, and `vtc eta retarget-monocular` commands
+- Experimental `vtc sim compile-task` command
 - Typed spec models with cross-file compatibility validation
 - A checked-in example bundle in `spec/`, `env/`, and `checklists/`
-- Tests covering the supported contract, validation rules, beta, gamma, and delta logic
+- Tests covering the supported contract, validation rules, and the current beta-through-eta MVP logic
 
-## Quick start
+## Quick Start
 
 ```bash
 python -m pip install -e .[dev]
@@ -40,9 +48,13 @@ vtc spec init --template ur5e_monocular_pick_place --output-dir ./example-bundle
 vtc video ingest-monocular --spec-dir spec --video ./demo.mp4 --out-dir ./artifacts/run01
 vtc human extract-monocular --spec-dir spec --beta-dir ./artifacts/run01 --out-dir ./artifacts/run01 --fourdhumans-root /path/to/4DHumans --smpl-model /path/to/SMPL_NEUTRAL.pkl
 vtc objects extract-monocular --spec-dir spec --beta-dir ./artifacts/run01 --out-dir ./artifacts/run01 --grounded-sam2-root /path/to/Grounded-SAM-2
+vtc epsilon compile-monocular --spec-dir spec --beta-dir ./artifacts/run01 --delta-dir ./artifacts/run01 --out-dir ./artifacts/run01
+vtc zeta assetize-monocular --spec-dir spec --epsilon-dir ./artifacts/run01 --out-dir ./artifacts/run01
+vtc eta retarget-monocular --spec-dir spec --gamma-dir ./artifacts/run01 --delta-dir ./artifacts/run01 --epsilon-dir ./artifacts/run01 --zeta-dir ./artifacts/run01 --out-dir ./artifacts/run01
+vtc sim compile-task --spec-dir spec --gamma-dir ./artifacts/run01 --epsilon-dir ./artifacts/run01 --zeta-dir ./artifacts/run01 --eta-dir ./artifacts/run01 --out-dir ./artifacts/run01
 ```
 
-## Alpha contract
+## Alpha Contract
 
 The supported bundle is no longer just three YAML files. Beta and later phases
 assume the full deterministic alpha contract exists:
@@ -57,18 +69,18 @@ assume the full deterministic alpha contract exists:
 - `env/sfm.environment.yml`
 - `env/human.environment.yml`
 - `env/objects.environment.yml`
+- `env/scene.environment.yml`
+- `env/sim.environment.yml`
 
 These files must be versioned together and validated as one bundle. The checked
 in profile requires:
 
-- `project.yaml` to own pre-roll, time, acceptance gates, and artifact owners
-- `project.yaml` to own gamma backbone selection, smoothing, and QC thresholds
-- `project.yaml` to own delta backbone selection, interaction thresholds, and mask encoding
+- `project.yaml` to own pre-roll, time, acceptance gates, artifact owners, and phase modes
 - `task.yaml` to reference ontology IDs instead of relying on free-form naming
 - `coordinate_frames.md` to carry machine-checkable YAML front matter
 - the env files to pin `python=3.10`
 
-## Beta outputs
+## Beta Outputs
 
 The monocular beta pipeline writes:
 
@@ -89,12 +101,7 @@ Compatibility copies are also emitted at the run root:
 - `camera_intrinsics.json`
 - `camera_poses.json`
 
-By design, beta reconstructs the sparse model from pre-roll keyframes only. The
-rest of the clip is attached by direct localization where possible and is
-otherwise left in the exported timeline as `registered=false` /
-`pose_status=unlocalized`.
-
-## Gamma outputs
+## Gamma Outputs
 
 The monocular gamma pipeline writes:
 
@@ -104,11 +111,7 @@ The monocular gamma pipeline writes:
 - `human/reprojection_overlays/`
 - `human/summary.json`
 
-Gamma is 4DHumans-only in the current profile. It always preserves 2D evidence
-plus camera-relative 3D, and it adds world-aligned estimates when beta camera
-poses support them for that frame.
-
-## Delta outputs
+## Delta Outputs
 
 The monocular delta pipeline writes:
 
@@ -122,9 +125,72 @@ The monocular delta pipeline writes:
 When `--keep-workdir` is used, the raw Grounded-SAM-2 staging area is also
 preserved under `objects/native/`.
 
-## Out of scope
+## Experimental Epsilon Outputs
 
-- MuJoCo MJCF compilation
+The current epsilon MVP writes proxy-scene artifacts while preserving truthful
+provenance:
+
+- `scene/world_metric_from_world.json`
+- `scene/support_plane.json`
+- `scene/static_dense/fused.ply`
+- `scene/static_dense/meshed-poisson.ply`
+- `scene/static_dense/meshed-delaunay.ply`
+- `scene/static_mesh.obj`
+- `scene/static_mesh.meta.json`
+- `scene/object_init_poses_metric.json`
+- `camera/camera_poses_metric.json`
+- `scene/epsilon_summary.json`
+
+These paths are stable for later phases, but the checked-in profile marks them
+as `proxy_scene` / `inherited_from_beta` until dense mode exists.
+
+## Experimental Zeta Outputs
+
+The current zeta MVP writes:
+
+- `assets/manifest.json`
+- `assets/*.meta.json`
+- `assets/mujoco_assets.xml`
+- `sim/assets_only.xml`
+- `sim/assets_only.mjb`
+- `sim/assets_smoke.json`
+- `assets/zeta_summary.json`
+
+Zeta currently assetizes conservative proxy geometry, but it requires a
+successful MuJoCo compile and smoke test to claim simulation readiness.
+
+## Experimental Eta Outputs
+
+The current eta MVP writes:
+
+- `retarget/robot_target.yaml`
+- `retarget/robot_base_in_metric_world.json`
+- `retarget/contact_schedule.json`
+- `retarget/robot_demo.npz`
+- `retarget/eta_summary.json`
+
+Eta is intentionally narrow in the current profile: UR5e + 2F-85, task-window
+pick/place replay, and the `pinocchio_seed` IK backend contract.
+
+## Experimental Theta Outputs
+
+Theta is now the canonical simulator compiler for the MVP. It writes:
+
+- `sim/scene.xml`
+- `sim/scene.mjb`
+- `sim/task.json`
+- `sim/validation.json`
+- `sim/playback/robot_trace.npz`
+- `sim/playback/human_arm_ghost.npz`
+
+Theta consumes the Alpha contract plus Epsilon/Zeta/Eta artifacts and is the
+first phase that owns the authoritative robot-in-scene MuJoCo task package.
+
+## Out Of Scope
+
+- Research-grade dense static reconstruction
+- Geometry-backed visual assetization
 - Imitation learning or RL training
 - ROS 2 or hardware deployment
+- Iota or Kappa execution
 - DINO-X or Track-Anything rescue flows in the default delta path

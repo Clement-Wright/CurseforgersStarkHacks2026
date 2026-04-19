@@ -12,6 +12,7 @@ artifact_owners:
   epsilon: geometry-lead
   zeta: asset-lead
   eta: controls-lead
+  theta: sim-lead
   deployment: controls-lead
 robot_target_id: ur5e_robotiq_2f85
 capture:
@@ -47,23 +48,35 @@ delta:
   mask_encoding: coco_rle
 epsilon:
   primary_backbone: artifact_fusion
+  geometry_mode: proxy_scene
+  metric_alignment_mode: inherited_from_beta
   preserve_beta_world: true
   metric_world_frame: M
-  support_plane_source: task_regions
+  support_plane_source: task_region_prior
   default_object_height_m: 0.04
   qc_overlay_frame_count: 12
 zeta:
   primary_backbone: mujoco_safe_assets
+  asset_mode: proxy_visual_and_collision
   collision_strategy: obb_single
   max_collision_geoms_per_object: 1
+  require_mujoco_compile: true
 eta:
-  primary_backbone: heuristic_ik
+  primary_backbone: arm_gripper_waypoint_replay
+  execution_mode: arm_gripper_waypoint_replay
   retarget_mode: planar_pick_place
+  ik_backend: pinocchio_seed
   pregrasp_clearance_m: 0.08
   transport_clearance_m: 0.12
   postplace_clearance_m: 0.08
   waypoint_hold_s: 0.25
   hdf5_export_policy: best_effort
+theta:
+  primary_backbone: canonical_mujoco_task
+  compile_backend: xml_tree_compiler
+  sim_world_frame: M
+  robot_model_source: vendored_local_copy
+  human_ghost_mode: arm_observables
 ontology:
   target_object_id: target_object
   receptacle_object_id: receptacle
@@ -83,8 +96,19 @@ acceptance:
   delta_max_duplicate_ids_in_review_sample: 0
   delta_min_mask_iou_sample: 0.8
   delta_require_rle_decode_success: true
+  epsilon_require_truthful_provenance: true
   epsilon_max_support_plane_rmse_m: 0.01
   epsilon_max_scale_anchor_rel_error: 0.05
+  zeta_require_mujoco_compile: true
+  zeta_require_passive_smoke: true
   zeta_max_collision_geoms_per_object: 4
   eta_min_demo_frames: 8
+  eta_min_ik_solve_rate: 0.95
   eta_max_joint_step_rad: 0.35
+  theta_require_scene_compile: true
+  theta_require_mjb_load: true
+  theta_zero_control_smoke_steps: 16
+  theta_trace_smoke_steps: 8
+  theta_require_audit_render: true
+  theta_require_robot_ghost_visible: true
+  theta_require_human_ghost_visible: true

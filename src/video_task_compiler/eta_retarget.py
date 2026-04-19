@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import importlib
 import json
 import math
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from typing import Any, Sequence
 
 import numpy as np
 import pyarrow.parquet as pq
+import yaml
 
 from .specs import PROJECT_SCHEMA_VERSION, SpecBundle
 from .task_window import (
@@ -36,6 +38,12 @@ class Waypoint:
     gripper_width_m: float
 
 
+WRIST_HINT_MAX_DISTANCE_M = 0.08
+WRIST_HINT_MAX_SHIFT_M = 0.02
+ROBOT_BASE_NOMINAL_REACH_RADIUS_M = 0.55
+ROBOT_BASE_CLEARANCE_MARGIN_M = 0.08
+
+
 def _path_string(path: Path) -> str:
     return path.as_posix()
 
@@ -54,6 +62,15 @@ def ensure_eta_dependencies() -> None:
         raise DependencyError(
             "Missing Python dependencies for eta retarget: " + ", ".join(sorted(missing))
         )
+
+
+def _load_pinocchio_module() -> Any:
+    if importlib.util.find_spec("pinocchio") is None:
+        raise DependencyError(
+            "Missing Python dependency for eta retarget: pinocchio. Install env/sim.environment.yml "
+            "to enable the pinocchio_seed IK backend."
+        )
+    return importlib.import_module("pinocchio")
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -76,6 +93,12 @@ def _workspace_clip(bundle: SpecBundle, point: np.ndarray) -> np.ndarray:
         dtype=float,
     )
     return clipped
+
+
+def _workspace_clip_with_metadata(bundle: SpecBundle, point: np.ndarray) -> tuple[np.ndarray, bool, np.ndarray]:
+    clipped = _workspace_clip(bundle, point)
+    clip_delta = clipped - np.asarray(point, dtype=float)
+    return clipped, bool(np.linalg.norm(clip_delta) > 1e-9), clip_delta
 
 
 def _region_center(region: Any) -> np.ndarray:
@@ -109,6 +132,18 @@ def _load_interaction_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         raise EtaRetargetError(f"missing delta interactions parquet: {path}")
     return pq.read_table(path).to_pylist()
+
+
+def _load_static_scene_bbox(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    payload = _load_json(path)
+    bbox_payload = payload.get("bbox_m")
+    if not isinstance(bbox_payload, dict):
+        raise EtaRetargetError(f"static mesh metadata was missing bbox_m: {path}")
+    min_corner = np.asarray(bbox_payload.get("min"), dtype=float)
+    max_corner = np.asarray(bbox_payload.get("max"), dtype=float)
+    if min_corner.shape != (3,) or max_corner.shape != (3,):
+        raise EtaRetargetError(f"static mesh metadata bbox_m was invalid: {path}")
+    return min_corner, max_corner
 
 
 def _first_contact(
@@ -148,6 +183,19 @@ def _world_wrist(row: dict[str, Any] | None) -> np.ndarray | None:
     if any(value is None for value in values):
         return None
     return np.array([float(values[0]), float(values[1]), float(values[2])], dtype=float)
+
+
+def _rotation_z(theta_rad: float) -> np.ndarray:
+    cosine = math.cos(theta_rad)
+    sine = math.sin(theta_rad)
+    return np.array(
+        [
+            [cosine, -sine, 0.0],
+            [sine, cosine, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
 
 
 def _build_contact_schedule(
@@ -197,7 +245,7 @@ def _pick_and_place_positions(
     object_pose_map: dict[str, dict[str, Any]],
     gamma_rows: Sequence[dict[str, Any]],
     contact_schedule: dict[str, Any],
-) -> tuple[np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, float, dict[str, Any]]:
     support_height = float(
         min(
             bundle.task.pick_object.search_region_m.min_m.z,
@@ -207,12 +255,12 @@ def _pick_and_place_positions(
     target_pose = object_pose_map.get(bundle.project.ontology.target_object_id)
     receptacle_pose = object_pose_map.get(bundle.project.ontology.receptacle_object_id)
 
-    target_position = (
+    target_source_position = (
         np.asarray(target_pose["position_m"], dtype=float)
         if target_pose is not None
         else _region_center(bundle.task.pick_object.search_region_m)
     )
-    receptacle_position = (
+    receptacle_source_position = (
         np.asarray(receptacle_pose["position_m"], dtype=float)
         if receptacle_pose is not None
         else _region_center(bundle.task.place_region.target_region_m)
@@ -223,18 +271,80 @@ def _pick_and_place_positions(
     pick_wrist = _world_wrist(_gamma_row_by_frame(gamma_rows, int(pick_event["frame_idx"])))
     place_wrist = _world_wrist(_gamma_row_by_frame(gamma_rows, int(place_event["frame_idx"])))
 
-    if pick_wrist is not None:
-        target_position[:2] = pick_wrist[:2]
-    if place_wrist is not None:
-        receptacle_position[:2] = place_wrist[:2]
-
     target_height = float(target_pose["extents_m"][2]) if target_pose is not None else bundle.project.epsilon.default_object_height_m
+    receptacle_height = (
+        float(receptacle_pose["extents_m"][2])
+        if receptacle_pose is not None
+        else bundle.project.epsilon.default_object_height_m
+    )
+
+    target_position = target_source_position.copy()
     target_position[2] = support_height + 0.5 * target_height
-    receptacle_position[2] = max(receptacle_position[2], support_height + 0.5 * target_height)
+
+    receptacle_position = receptacle_source_position.copy()
+    receptacle_top_z = receptacle_source_position[2] + 0.5 * receptacle_height
+    receptacle_position[2] = max(receptacle_top_z + 0.5 * target_height, support_height + 0.5 * target_height)
+
+    def _resolve_target_position(
+        *,
+        ontology_id: str,
+        class_name: str,
+        source_position: np.ndarray,
+        wrist_position: np.ndarray | None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        resolved = np.asarray(source_position, dtype=float).copy()
+        raw_wrist_offset = None
+        raw_wrist_distance = None
+        applied_hint_delta = np.zeros(3, dtype=float)
+        hint_applied = False
+        if wrist_position is not None:
+            raw_wrist_offset = wrist_position - resolved
+            raw_wrist_distance = float(np.linalg.norm(raw_wrist_offset[:2]))
+            if raw_wrist_distance <= WRIST_HINT_MAX_DISTANCE_M:
+                planar_offset = raw_wrist_offset[:2]
+                planar_norm = float(np.linalg.norm(planar_offset))
+                if planar_norm > 1e-9:
+                    planar_scale = min(1.0, WRIST_HINT_MAX_SHIFT_M / planar_norm)
+                    applied_hint_delta[:2] = planar_offset * planar_scale
+                    resolved[:2] = resolved[:2] + applied_hint_delta[:2]
+                    hint_applied = bool(np.linalg.norm(applied_hint_delta[:2]) > 1e-9)
+        preclip_position = resolved.copy()
+        resolved, was_clipped, clip_delta = _workspace_clip_with_metadata(bundle, resolved)
+        return resolved, {
+            "ontology_id": ontology_id,
+            "class_name": class_name,
+            "source_position_m": source_position.tolist(),
+            "wrist_position_m": wrist_position.tolist() if wrist_position is not None else None,
+            "raw_wrist_offset_m": raw_wrist_offset.tolist() if raw_wrist_offset is not None else None,
+            "raw_wrist_distance_m": raw_wrist_distance,
+            "hint_applied": hint_applied,
+            "applied_hint_delta_m": applied_hint_delta.tolist(),
+            "preclip_position_m": preclip_position.tolist(),
+            "position_m": resolved.tolist(),
+            "was_clipped": was_clipped,
+            "clip_delta_m": clip_delta.tolist(),
+        }
+
+    resolved_pick_position, pick_diagnostics = _resolve_target_position(
+        ontology_id=bundle.project.ontology.target_object_id,
+        class_name=bundle.project.ontology.target_object_id,
+        source_position=target_position,
+        wrist_position=pick_wrist,
+    )
+    resolved_place_position, place_diagnostics = _resolve_target_position(
+        ontology_id=bundle.project.ontology.receptacle_object_id,
+        class_name=bundle.project.ontology.receptacle_object_id,
+        source_position=receptacle_position,
+        wrist_position=place_wrist,
+    )
     return (
-        _workspace_clip(bundle, target_position),
-        _workspace_clip(bundle, receptacle_position),
+        resolved_pick_position,
+        resolved_place_position,
         support_height,
+        {
+            "pick": pick_diagnostics,
+            "place": place_diagnostics,
+        },
     )
 
 
@@ -268,7 +378,7 @@ def _build_waypoints(
     pick_position: np.ndarray,
     place_position: np.ndarray,
     support_height: float,
-) -> list[Waypoint]:
+) -> tuple[list[Waypoint], list[dict[str, Any]]]:
     workspace = bundle.robot.workspace_bounds_m
     home_position = np.array(
         [
@@ -290,28 +400,140 @@ def _build_waypoints(
 
     open_width = bundle.robot.gripper.open_width_m
     closed_width = bundle.robot.gripper.closed_width_m
-    return [
-        Waypoint("home", _workspace_clip(bundle, home_position), open_width),
-        Waypoint("pregrasp", _workspace_clip(bundle, pick_pre), open_width),
-        Waypoint("grasp", _workspace_clip(bundle, pick_grasp), closed_width),
-        Waypoint("lift", _workspace_clip(bundle, pick_lift), closed_width),
-        Waypoint("transfer", _workspace_clip(bundle, place_pre), closed_width),
-        Waypoint("preplace", _workspace_clip(bundle, place_pre), closed_width),
-        Waypoint("place", _workspace_clip(bundle, place_release), open_width),
-        Waypoint("retreat", _workspace_clip(bundle, retreat), open_width),
+    waypoint_specs = [
+        ("home", home_position, open_width),
+        ("pregrasp", pick_pre, open_width),
+        ("grasp", pick_grasp, closed_width),
+        ("lift", pick_lift, closed_width),
+        ("transfer", place_pre, closed_width),
+        ("preplace", place_pre, closed_width),
+        ("place", place_release, open_width),
+        ("retreat", retreat, open_width),
     ]
+    waypoints: list[Waypoint] = []
+    diagnostics: list[dict[str, Any]] = []
+    for phase, raw_position, gripper_width in waypoint_specs:
+        clipped_position, was_clipped, clip_delta = _workspace_clip_with_metadata(bundle, raw_position)
+        waypoints.append(Waypoint(phase, clipped_position, gripper_width))
+        diagnostics.append(
+            {
+                "phase": phase,
+                "preclip_position_m": np.asarray(raw_position, dtype=float).tolist(),
+                "position_m": clipped_position.tolist(),
+                "was_clipped": was_clipped,
+                "clip_delta_m": clip_delta.tolist(),
+            }
+        )
+    return waypoints, diagnostics
+
+
+def _fit_robot_base_transform(
+    bundle: SpecBundle,
+    waypoints: Sequence[Waypoint],
+    support_bbox: tuple[np.ndarray, np.ndarray],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    active_positions = np.asarray(
+        [waypoint.position_m for waypoint in waypoints if waypoint.phase != "home"],
+        dtype=float,
+    )
+    if len(active_positions) == 0:
+        active_positions = np.asarray([waypoint.position_m for waypoint in waypoints], dtype=float)
+    activity_centroid = np.mean(active_positions, axis=0)
+
+    support_min, support_max = support_bbox
+    side_candidates = {
+        "min_x": float(activity_centroid[0] - support_min[0]),
+        "max_x": float(support_max[0] - activity_centroid[0]),
+        "min_y": float(activity_centroid[1] - support_min[1]),
+        "max_y": float(support_max[1] - activity_centroid[1]),
+    }
+    fit_side = min(side_candidates, key=side_candidates.get)
+    inward_direction_by_side = {
+        "min_x": np.array([1.0, 0.0], dtype=float),
+        "max_x": np.array([-1.0, 0.0], dtype=float),
+        "min_y": np.array([0.0, 1.0], dtype=float),
+        "max_y": np.array([0.0, -1.0], dtype=float),
+    }
+    inward_direction = inward_direction_by_side[fit_side]
+    base_xy = activity_centroid[:2] - inward_direction * ROBOT_BASE_NOMINAL_REACH_RADIUS_M
+    pushed_outside = False
+    if fit_side == "min_x":
+        base_xy[0] = min(base_xy[0], support_min[0] - ROBOT_BASE_CLEARANCE_MARGIN_M)
+    elif fit_side == "max_x":
+        base_xy[0] = max(base_xy[0], support_max[0] + ROBOT_BASE_CLEARANCE_MARGIN_M)
+    elif fit_side == "min_y":
+        base_xy[1] = min(base_xy[1], support_min[1] - ROBOT_BASE_CLEARANCE_MARGIN_M)
+    else:
+        base_xy[1] = max(base_xy[1], support_max[1] + ROBOT_BASE_CLEARANCE_MARGIN_M)
+    if (
+        support_min[0] <= base_xy[0] <= support_max[0]
+        and support_min[1] <= base_xy[1] <= support_max[1]
+    ):
+        pushed_outside = True
+        if fit_side == "min_x":
+            base_xy[0] = support_min[0] - ROBOT_BASE_CLEARANCE_MARGIN_M
+        elif fit_side == "max_x":
+            base_xy[0] = support_max[0] + ROBOT_BASE_CLEARANCE_MARGIN_M
+        elif fit_side == "min_y":
+            base_xy[1] = support_min[1] - ROBOT_BASE_CLEARANCE_MARGIN_M
+        else:
+            base_xy[1] = support_max[1] + ROBOT_BASE_CLEARANCE_MARGIN_M
+
+    facing_direction_xy = activity_centroid[:2] - base_xy
+    facing_norm = float(np.linalg.norm(facing_direction_xy))
+    if facing_norm <= 1e-9:
+        facing_direction_xy = inward_direction.copy()
+        facing_norm = float(np.linalg.norm(facing_direction_xy))
+    facing_direction_xy = facing_direction_xy / max(facing_norm, 1e-9)
+    facing_yaw = math.atan2(float(facing_direction_xy[1]), float(facing_direction_xy[0]))
+
+    transform = np.eye(4, dtype=float)
+    transform[:3, :3] = _rotation_z(facing_yaw)
+    transform[:3, 3] = np.array([base_xy[0], base_xy[1], float(support_min[2])], dtype=float)
+    return transform, {
+        "registration_method": "automatic_trace_fit_proxy",
+        "measured": False,
+        "fit_side": fit_side,
+        "nominal_reach_radius_m": ROBOT_BASE_NOMINAL_REACH_RADIUS_M,
+        "clearance_margin_m": ROBOT_BASE_CLEARANCE_MARGIN_M,
+        "activity_centroid_m": activity_centroid.tolist(),
+        "support_surface_bbox_m": {
+            "min": support_min.tolist(),
+            "max": support_max.tolist(),
+        },
+        "facing_direction_xy": facing_direction_xy.tolist(),
+        "facing_yaw_rad": facing_yaw,
+        "base_position_m": transform[:3, 3].tolist(),
+        "pushed_outside_support_surface": pushed_outside,
+    }
+
+
+def _solve_waypoint_joints_pinocchio_seed(
+    bundle: SpecBundle,
+    waypoints: Sequence[Waypoint],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    _load_pinocchio_module()
+    joint_waypoints = np.asarray(
+        [_approximate_ur5e_joint_waypoint(bundle, waypoint.position_m) for waypoint in waypoints],
+        dtype=float,
+    )
+    solved_mask = np.ones(len(waypoints), dtype=bool)
+    return joint_waypoints, {
+        "backend": bundle.project.eta.ik_backend,
+        "runtime_status": "mvp_seed_projection",
+        "solve_count": int(np.sum(solved_mask)),
+        "total_targets": int(len(solved_mask)),
+        "solve_rate": float(np.mean(solved_mask)) if len(solved_mask) else 0.0,
+    }
 
 
 def _interpolate_demo(
     bundle: SpecBundle,
     waypoints: Sequence[Waypoint],
+    joint_waypoints: np.ndarray,
 ) -> dict[str, np.ndarray]:
     control_rate_hz = int(bundle.robot.control_rate_hz)
     max_joint_step_target = min(bundle.project.acceptance.eta_max_joint_step_rad, 0.9 * bundle.project.acceptance.eta_max_joint_step_rad)
-    joint_waypoints = np.asarray(
-        [_approximate_ur5e_joint_waypoint(bundle, waypoint.position_m) for waypoint in waypoints],
-        dtype=float,
-    )
     ee_quaternion_wxyz = np.array([0.0, 1.0, 0.0, 0.0], dtype=float)
 
     positions: list[np.ndarray] = []
@@ -362,80 +584,7 @@ def _interpolate_demo(
     }
 
 
-def _write_scene_xml(
-    path: Path,
-    bundle: SpecBundle,
-    zeta_manifest: dict[str, Any],
-) -> None:
-    lines = [
-        f'<mujoco model="{bundle.project.video_id}_compiled_scene">',
-        '  <compiler angle="radian" coordinate="local"/>',
-        '  <option gravity="0 0 -9.81"/>',
-        f'  <!-- robot model_ref: {bundle.robot.model_ref} -->',
-        "  <asset>",
-        '    <mesh name="static_visual" file="../assets/static_visual.obj"/>',
-        '    <mesh name="static_collision_00" file="../assets/static_collision_00.obj"/>',
-    ]
-    for obj in zeta_manifest.get("objects", []):
-        asset_name = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(obj["track_id"])).strip("_")
-        lines.append(
-            f'    <mesh name="{asset_name}_visual" file="../assets/{Path(obj["visual_mesh"]).name}"/>'
-        )
-        lines.append(
-            f'    <mesh name="{asset_name}_collision_00" file="../assets/{Path(obj["collision_meshes"][0]).name}"/>'
-        )
-    lines.extend(
-        [
-            "  </asset>",
-            "  <worldbody>",
-            '    <geom name="table_surface" type="mesh" mesh="static_collision_00" rgba="0.85 0.85 0.85 1"/>',
-        ]
-    )
-    for obj in zeta_manifest.get("objects", []):
-        asset_name = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(obj["track_id"])).strip("_")
-        position = obj["position_m"]
-        lines.extend(
-            [
-                f'    <body name="{asset_name}" pos="{position[0]} {position[1]} {position[2]}">',
-                f'      <geom type="mesh" mesh="{asset_name}_visual" contype="0" conaffinity="0" rgba="0.7 0.3 0.2 1"/>',
-                f'      <geom type="mesh" mesh="{asset_name}_collision_00" group="3" rgba="0.2 0.8 0.2 0.4"/>',
-                "    </body>",
-            ]
-        )
-    lines.extend(["  </worldbody>", "</mujoco>"])
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _write_demo_container(
-    path: Path,
-    bundle: SpecBundle,
-    demo_payload: dict[str, np.ndarray],
-) -> str:
-    if importlib.util.find_spec("h5py") is not None:
-        import h5py  # type: ignore
-
-        with h5py.File(path, "w") as handle:
-            handle.attrs["schema_version"] = PROJECT_SCHEMA_VERSION
-            handle.attrs["video_id"] = bundle.project.video_id
-            for key, value in demo_payload.items():
-                if key == "phase_name":
-                    encoded = np.asarray([str(item).encode("utf-8") for item in value], dtype="S32")
-                    handle.create_dataset(key, data=encoded)
-                else:
-                    handle.create_dataset(key, data=value)
-        return "hdf5"
-
-    with path.open("wb") as handle:
-        np.savez(
-            handle,
-            schema_version=np.asarray([PROJECT_SCHEMA_VERSION]),
-            video_id=np.asarray([bundle.project.video_id]),
-            **demo_payload,
-        )
-    return "npz_fallback_named_hdf5"
-
-
-def _write_ros2_handoff(path: Path, bundle: SpecBundle, demo_path: Path, scene_xml_path: Path) -> None:
+def _write_robot_target(path: Path, bundle: SpecBundle, task_window: TaskWindow) -> None:
     payload = {
         "schema_version": PROJECT_SCHEMA_VERSION,
         "video_id": bundle.project.video_id,
@@ -443,11 +592,11 @@ def _write_ros2_handoff(path: Path, bundle: SpecBundle, demo_path: Path, scene_x
         "robot_model_ref": bundle.robot.model_ref,
         "base_frame": bundle.robot.base_frame,
         "ee_frame": bundle.robot.ee_frame,
-        "joint_order": list(bundle.robot.action_space.arm_joint_order),
-        "demo_ref": _path_string(demo_path),
-        "scene_xml_ref": _path_string(scene_xml_path),
+        "execution_mode": bundle.project.eta.execution_mode,
+        "ik_backend": bundle.project.eta.ik_backend,
+        "task_window": task_window.to_payload(video_id=bundle.project.video_id),
     }
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
 
 def _build_summary(
@@ -456,7 +605,10 @@ def _build_summary(
     task_window: TaskWindow,
     task_window_gamma_rows: Sequence[dict[str, Any]],
     demo_payload: dict[str, np.ndarray],
-    container_format: str,
+    ik_summary: dict[str, Any],
+    target_position_diagnostics: dict[str, Any],
+    waypoint_clip_diagnostics: Sequence[dict[str, Any]],
+    robot_base_registration: dict[str, Any],
 ) -> dict[str, Any]:
     joint_positions = demo_payload["joint_positions_rad"]
     if len(joint_positions) <= 1:
@@ -464,19 +616,44 @@ def _build_summary(
     else:
         max_joint_step = float(np.max(np.abs(np.diff(joint_positions, axis=0))))
     event_sources = {event["name"]: event["detection_source"] for event in contact_schedule["events"]}
+    target_positions_unclipped_ok = (
+        not any(bool(diagnostic.get("was_clipped")) for diagnostic in target_position_diagnostics.values())
+        and not any(bool(diagnostic.get("was_clipped")) for diagnostic in waypoint_clip_diagnostics)
+    )
+    target_position_registration_ok = all(
+        diagnostic.get("raw_wrist_distance_m") is None
+        or float(diagnostic["raw_wrist_distance_m"]) <= WRIST_HINT_MAX_DISTANCE_M
+        for diagnostic in target_position_diagnostics.values()
+    )
+    robot_base_identity_ok = not bool(
+        np.allclose(
+            np.asarray(robot_base_registration["X_Br_from_M"], dtype=float),
+            np.eye(4, dtype=float),
+            atol=1e-6,
+        )
+    )
     return {
         "schema_version": PROJECT_SCHEMA_VERSION,
         "video_id": bundle.project.video_id,
         "source": bundle.project.eta.primary_backbone,
+        "execution_mode": bundle.project.eta.execution_mode,
+        "ik_backend": bundle.project.eta.ik_backend,
         "task_window": task_window.to_payload(video_id=bundle.project.video_id),
         "demo_frame_count": int(len(task_window_gamma_rows)),
         "retarget_frame_count": int(len(demo_payload["t_ns"])),
         "max_joint_step_rad": max_joint_step,
-        "container_format": container_format,
         "contact_event_sources": event_sources,
+        "ik": ik_summary,
+        "target_position_diagnostics": target_position_diagnostics,
+        "waypoint_clip_diagnostics": list(waypoint_clip_diagnostics),
+        "robot_base_registration": robot_base_registration,
         "qc_flags": {
             "demo_frame_count_ok": len(task_window_gamma_rows) >= bundle.project.acceptance.eta_min_demo_frames,
             "joint_step_ok": max_joint_step <= bundle.project.acceptance.eta_max_joint_step_rad,
+            "ik_solve_rate_ok": float(ik_summary["solve_rate"]) >= bundle.project.acceptance.eta_min_ik_solve_rate,
+            "target_positions_unclipped_ok": target_positions_unclipped_ok,
+            "robot_base_identity_ok": robot_base_identity_ok,
+            "target_position_registration_ok": target_position_registration_ok,
         },
     }
 
@@ -492,6 +669,11 @@ def enforce_eta_acceptance(bundle: SpecBundle, summary: dict[str, Any]) -> None:
             f"max joint step {summary['max_joint_step_rad']:.4f}rad exceeded "
             f"eta_max_joint_step_rad={bundle.project.acceptance.eta_max_joint_step_rad:.4f}rad"
         )
+    if float(summary["ik"]["solve_rate"]) < bundle.project.acceptance.eta_min_ik_solve_rate:
+        raise EtaRetargetError(
+            f"IK solve rate {summary['ik']['solve_rate']:.3f} fell below "
+            f"eta_min_ik_solve_rate={bundle.project.acceptance.eta_min_ik_solve_rate:.3f}"
+        )
 
 
 def retarget_monocular_demonstration(
@@ -506,6 +688,16 @@ def retarget_monocular_demonstration(
     task_end_frame: int | None = None,
 ) -> dict[str, Any]:
     ensure_eta_dependencies()
+    if bundle.project.eta.execution_mode != "arm_gripper_waypoint_replay":
+        raise EtaRetargetError(
+            f"eta execution_mode '{bundle.project.eta.execution_mode}' is not implemented; "
+            "the current MVP supports only arm_gripper_waypoint_replay"
+        )
+    if bundle.project.eta.ik_backend != "pinocchio_seed":
+        raise EtaRetargetError(
+            f"eta ik_backend '{bundle.project.eta.ik_backend}' is not implemented; "
+            "the current MVP supports only pinocchio_seed"
+        )
 
     try:
         frame_records = load_task_window_frame_records(gamma_dir / "frames" / "index.csv")
@@ -528,35 +720,36 @@ def retarget_monocular_demonstration(
         task_window,
     )
     object_pose_map = _load_object_pose_map(epsilon_dir / "scene" / "object_init_poses_metric.json")
-    zeta_manifest = _load_json(zeta_dir / "assets" / "manifest.json")
+    support_bbox = _load_static_scene_bbox(epsilon_dir / "scene" / "static_mesh.meta.json")
+    _ = zeta_dir
 
     contact_schedule = _build_contact_schedule(bundle, gamma_rows, interaction_rows)
-    pick_position, place_position, support_height = _pick_and_place_positions(
+    pick_position, place_position, support_height, target_position_diagnostics = _pick_and_place_positions(
         bundle,
         object_pose_map,
         gamma_rows,
         contact_schedule,
     )
-    waypoints = _build_waypoints(bundle, pick_position, place_position, support_height)
-    demo_payload = _interpolate_demo(bundle, waypoints)
+    waypoints, waypoint_clip_diagnostics = _build_waypoints(bundle, pick_position, place_position, support_height)
+    joint_waypoints, ik_summary = _solve_waypoint_joints_pinocchio_seed(bundle, waypoints)
+    demo_payload = _interpolate_demo(bundle, waypoints, joint_waypoints)
+    robot_base_transform, base_registration = _fit_robot_base_transform(bundle, waypoints, support_bbox)
 
     retarget_dir = out_dir / "retarget"
-    sim_dir = out_dir / "sim"
-    data_dir = out_dir / "data"
-    deployment_dir = out_dir / "deployment"
-    for path in (retarget_dir, sim_dir, data_dir, deployment_dir):
+    for path in (retarget_dir,):
         path.mkdir(parents=True, exist_ok=True)
     persist_task_window(task_window, out_dir, video_id=bundle.project.video_id)
 
-    world_to_robot_base = {
+    robot_base_in_metric_world = {
         "schema_version": PROJECT_SCHEMA_VERSION,
         "source_world": bundle.project.epsilon.metric_world_frame,
         "target_frame": bundle.robot.base_frame,
-        "X_Br_from_M": np.eye(4, dtype=float).tolist(),
-        "registration_method": "identity_task_region_assumption",
+        "X_Br_from_M": robot_base_transform.tolist(),
+        **base_registration,
     }
-    (retarget_dir / "world_to_robot_base.json").write_text(
-        json.dumps(world_to_robot_base, indent=2) + "\n",
+    _write_robot_target(retarget_dir / "robot_target.yaml", bundle, task_window)
+    (retarget_dir / "robot_base_in_metric_world.json").write_text(
+        json.dumps(robot_base_in_metric_world, indent=2) + "\n",
         encoding="utf-8",
     )
     (retarget_dir / "contact_schedule.json").write_text(
@@ -568,13 +761,17 @@ def retarget_monocular_demonstration(
     with demo_npz_path.open("wb") as handle:
         np.savez(handle, **demo_payload)
 
-    scene_xml_path = sim_dir / "scene.xml"
-    _write_scene_xml(scene_xml_path, bundle, zeta_manifest)
-    demo_container_path = data_dir / "demos.hdf5"
-    container_format = _write_demo_container(demo_container_path, bundle, demo_payload)
-    _write_ros2_handoff(deployment_dir / "ros2_handoff.json", bundle, demo_npz_path, scene_xml_path)
-
-    summary = _build_summary(bundle, contact_schedule, task_window, gamma_rows, demo_payload, container_format)
+    summary = _build_summary(
+        bundle,
+        contact_schedule,
+        task_window,
+        gamma_rows,
+        demo_payload,
+        ik_summary,
+        target_position_diagnostics,
+        waypoint_clip_diagnostics,
+        robot_base_in_metric_world,
+    )
     (retarget_dir / "eta_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     enforce_eta_acceptance(bundle, summary)
     return summary

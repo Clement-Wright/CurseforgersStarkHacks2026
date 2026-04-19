@@ -298,11 +298,22 @@ class ProjectAcceptanceSpec(BaseModel):
     delta_max_duplicate_ids_in_review_sample: int = Field(ge=0)
     delta_min_mask_iou_sample: float = Field(gt=0.0, le=1.0)
     delta_require_rle_decode_success: bool
+    epsilon_require_truthful_provenance: bool
     epsilon_max_support_plane_rmse_m: float = Field(ge=0.0)
     epsilon_max_scale_anchor_rel_error: float = Field(ge=0.0)
+    zeta_require_mujoco_compile: bool
+    zeta_require_passive_smoke: bool
     zeta_max_collision_geoms_per_object: int = Field(ge=1)
     eta_min_demo_frames: int = Field(ge=1)
+    eta_min_ik_solve_rate: float = Field(gt=0.0, le=1.0)
     eta_max_joint_step_rad: float = Field(gt=0.0)
+    theta_require_scene_compile: bool
+    theta_require_mjb_load: bool
+    theta_zero_control_smoke_steps: int = Field(ge=1)
+    theta_trace_smoke_steps: int = Field(ge=1)
+    theta_require_audit_render: bool
+    theta_require_robot_ghost_visible: bool
+    theta_require_human_ghost_visible: bool
 
 
 class ProjectGammaSmoothingSpec(BaseModel):
@@ -344,9 +355,11 @@ class ProjectEpsilonSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     primary_backbone: Literal["artifact_fusion"]
+    geometry_mode: Literal["proxy_scene", "dense_static_reconstruction"]
+    metric_alignment_mode: Literal["inherited_from_beta", "measured_sim3"]
     preserve_beta_world: Literal[True]
     metric_world_frame: Literal["M"]
-    support_plane_source: Literal["task_regions"]
+    support_plane_source: Literal["task_region_prior", "geometry_fit"]
     default_object_height_m: float = Field(gt=0.0)
     qc_overlay_frame_count: int = Field(ge=1)
 
@@ -355,20 +368,34 @@ class ProjectZetaSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     primary_backbone: Literal["mujoco_safe_assets"]
+    asset_mode: Literal["proxy_visual_and_collision", "geometry_backed_assets"]
     collision_strategy: Literal["obb_single"]
     max_collision_geoms_per_object: int = Field(ge=1)
+    require_mujoco_compile: Literal[True]
 
 
 class ProjectEtaSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    primary_backbone: Literal["heuristic_ik"]
+    primary_backbone: Literal["arm_gripper_waypoint_replay"]
+    execution_mode: Literal["arm_gripper_waypoint_replay"]
     retarget_mode: Literal["planar_pick_place"]
+    ik_backend: Literal["pinocchio_seed"]
     pregrasp_clearance_m: float = Field(gt=0.0)
     transport_clearance_m: float = Field(gt=0.0)
     postplace_clearance_m: float = Field(gt=0.0)
     waypoint_hold_s: float = Field(gt=0.0)
     hdf5_export_policy: Literal["best_effort"]
+
+
+class ProjectThetaSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    primary_backbone: Literal["canonical_mujoco_task"]
+    compile_backend: Literal["xml_tree_compiler"]
+    sim_world_frame: Literal["M"]
+    robot_model_source: Literal["vendored_local_copy"]
+    human_ghost_mode: Literal["arm_observables"]
 
 
 class ProjectSpec(BaseModel):
@@ -392,6 +419,7 @@ class ProjectSpec(BaseModel):
     epsilon: ProjectEpsilonSpec
     zeta: ProjectZetaSpec
     eta: ProjectEtaSpec
+    theta: ProjectThetaSpec
     ontology: ProjectOntologyRefsSpec
     sponsor_resources: list[str] = Field(min_length=1)
     acceptance: ProjectAcceptanceSpec
@@ -495,6 +523,8 @@ def resolve_bundle_paths(bundle_or_spec_dir: Path) -> BundlePaths:
             "sfm": env_dir / "sfm.environment.yml",
             "human": env_dir / "human.environment.yml",
             "objects": env_dir / "objects.environment.yml",
+            "scene": env_dir / "scene.environment.yml",
+            "sim": env_dir / "sim.environment.yml",
         },
     )
 
@@ -989,14 +1019,40 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
             )
         )
 
-    if bundle.project.epsilon.support_plane_source != "task_regions":
-        issues.append(
-            _compat_issue(
-                bundle.project_path,
-                "epsilon.support_plane_source",
-                "epsilon currently supports only task_regions support-plane initialization",
+    if bundle.project.acceptance.epsilon_require_truthful_provenance and bundle.project.epsilon.geometry_mode == "proxy_scene":
+        if bundle.project.epsilon.metric_alignment_mode != "inherited_from_beta":
+            issues.append(
+                _compat_issue(
+                    bundle.project_path,
+                    "epsilon.metric_alignment_mode",
+                    "proxy-scene epsilon must inherit metric alignment from beta",
+                )
             )
-        )
+        if bundle.project.epsilon.support_plane_source != "task_region_prior":
+            issues.append(
+                _compat_issue(
+                    bundle.project_path,
+                    "epsilon.support_plane_source",
+                    "proxy-scene epsilon must mark the support plane as task_region_prior",
+                )
+            )
+    elif bundle.project.epsilon.geometry_mode == "dense_static_reconstruction":
+        if bundle.project.epsilon.metric_alignment_mode != "measured_sim3":
+            issues.append(
+                _compat_issue(
+                    bundle.project_path,
+                    "epsilon.metric_alignment_mode",
+                    "dense_static_reconstruction epsilon must use measured_sim3 metric alignment",
+                )
+            )
+        if bundle.project.epsilon.support_plane_source != "geometry_fit":
+            issues.append(
+                _compat_issue(
+                    bundle.project_path,
+                    "epsilon.support_plane_source",
+                    "dense_static_reconstruction epsilon must use geometry_fit support-plane estimation",
+                )
+            )
 
     if bundle.project.zeta.primary_backbone != "mujoco_safe_assets":
         issues.append(
@@ -1004,6 +1060,15 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
                 bundle.project_path,
                 "zeta.primary_backbone",
                 "zeta currently supports only the mujoco_safe_assets backbone",
+            )
+        )
+
+    if bundle.project.zeta.asset_mode != "proxy_visual_and_collision":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "zeta.asset_mode",
+                "zeta currently supports only proxy_visual_and_collision assetization",
             )
         )
 
@@ -1025,12 +1090,30 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
             )
         )
 
-    if bundle.project.eta.primary_backbone != "heuristic_ik":
+    if not bundle.project.zeta.require_mujoco_compile:
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "zeta.require_mujoco_compile",
+                "zeta MVP requires MuJoCo compilation to remain enabled",
+            )
+        )
+
+    if bundle.project.eta.primary_backbone != "arm_gripper_waypoint_replay":
         issues.append(
             _compat_issue(
                 bundle.project_path,
                 "eta.primary_backbone",
-                "eta currently supports only the heuristic_ik backbone",
+                "eta currently supports only the arm_gripper_waypoint_replay backbone",
+            )
+        )
+
+    if bundle.project.eta.execution_mode != "arm_gripper_waypoint_replay":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "eta.execution_mode",
+                "eta currently supports only arm_gripper_waypoint_replay execution",
             )
         )
 
@@ -1040,6 +1123,60 @@ def validate_bundle(bundle: SpecBundle) -> SpecBundle:
                 bundle.project_path,
                 "eta.retarget_mode",
                 "eta currently supports only planar_pick_place retargeting",
+            )
+        )
+
+    if bundle.project.eta.ik_backend != "pinocchio_seed":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "eta.ik_backend",
+                "eta currently supports only the pinocchio_seed IK backend contract",
+            )
+        )
+
+    if bundle.project.theta.primary_backbone != "canonical_mujoco_task":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "theta.primary_backbone",
+                "theta currently supports only the canonical_mujoco_task backbone",
+            )
+        )
+
+    if bundle.project.theta.compile_backend != "xml_tree_compiler":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "theta.compile_backend",
+                "theta currently supports only the xml_tree_compiler backend",
+            )
+        )
+
+    if bundle.project.theta.sim_world_frame != bundle.project.epsilon.metric_world_frame:
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "theta.sim_world_frame",
+                "theta simulator world frame must match epsilon.metric_world_frame",
+            )
+        )
+
+    if bundle.project.theta.robot_model_source != "vendored_local_copy":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "theta.robot_model_source",
+                "theta currently requires a vendored_local_copy robot model source",
+            )
+        )
+
+    if bundle.project.theta.human_ghost_mode != "arm_observables":
+        issues.append(
+            _compat_issue(
+                bundle.project_path,
+                "theta.human_ghost_mode",
+                "theta currently supports only arm_observables human ghost playback",
             )
         )
 

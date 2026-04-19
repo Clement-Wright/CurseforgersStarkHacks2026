@@ -19,6 +19,7 @@ from .epsilon_scene import EpsilonSceneError, compile_metric_scene
 from .human_extract import HumanExtractError, extract_monocular_human_motion
 from .eta_retarget import EtaRetargetError, retarget_monocular_demonstration
 from .object_extract import ObjectExtractError, extract_monocular_objects
+from .theta_sim import ThetaSimError, compile_task_package
 from .video_ingest import VideoIngestError, ingest_monocular_video
 from .zeta_assets import ZetaAssetError, assetize_metric_scene
 
@@ -30,6 +31,7 @@ objects_app = typer.Typer(help="Run delta object extraction pipelines.")
 epsilon_app = typer.Typer(help="Run epsilon metric scene compilation pipelines.")
 zeta_app = typer.Typer(help="Run zeta MuJoCo assetization pipelines.")
 eta_app = typer.Typer(help="Run eta robot retargeting pipelines.")
+sim_app = typer.Typer(help="Run theta simulator compilation pipelines.")
 app.add_typer(spec_app, name="spec")
 app.add_typer(video_app, name="video")
 app.add_typer(human_app, name="human")
@@ -37,6 +39,7 @@ app.add_typer(objects_app, name="objects")
 app.add_typer(epsilon_app, name="epsilon")
 app.add_typer(zeta_app, name="zeta")
 app.add_typer(eta_app, name="eta")
+app.add_typer(sim_app, name="sim")
 
 
 def _template_dir(template: str) -> Path:
@@ -575,7 +578,7 @@ def retarget_monocular_demo_cli(
         dir_okay=True,
         writable=True,
         resolve_path=True,
-        help="Directory that will receive eta retarget/, sim/, data/, and deployment/ artifacts.",
+        help="Directory that will receive eta retarget/ artifacts.",
     ),
     task_start_frame: Optional[int] = typer.Option(
         None,
@@ -614,6 +617,92 @@ def retarget_monocular_demo_cli(
         raise typer.Exit(code=1) from exc
 
     typer.echo(f"eta retarget completed successfully in {out_dir}")
+
+
+@sim_app.command("compile-task")
+def compile_task_cli(
+    spec_dir: Path = typer.Option(
+        ...,
+        "--spec-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Bundle root or spec/ directory for the validated contract bundle.",
+    ),
+    gamma_dir: Path = typer.Option(
+        ...,
+        "--gamma-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Gamma artifact root that contains human/ outputs.",
+    ),
+    epsilon_dir: Path = typer.Option(
+        ...,
+        "--epsilon-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Artifact root that already contains epsilon scene outputs.",
+    ),
+    zeta_dir: Path = typer.Option(
+        ...,
+        "--zeta-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Artifact root that already contains zeta assets/ outputs.",
+    ),
+    eta_dir: Path = typer.Option(
+        ...,
+        "--eta-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Artifact root that already contains eta retarget/ outputs.",
+    ),
+    out_dir: Path = typer.Option(
+        ...,
+        "--out-dir",
+        file_okay=False,
+        dir_okay=True,
+        writable=True,
+        resolve_path=True,
+        help="Directory that will receive theta sim/ artifacts.",
+    ),
+) -> None:
+    """Compile the canonical MuJoCo task package from Alpha-through-Eta artifacts."""
+    try:
+        bundle = load_bundle(spec_dir)
+        validate_bundle(bundle)
+        if bundle.capture.modality != "rgb_monocular":
+            raise ThetaSimError("sim compile-task only supports rgb_monocular capture bundles")
+        compile_task_package(
+            bundle=bundle,
+            gamma_dir=gamma_dir,
+            epsilon_dir=epsilon_dir,
+            zeta_dir=zeta_dir,
+            eta_dir=eta_dir,
+            out_dir=out_dir,
+        )
+    except SpecValidationError as exc:
+        _print_issues(exc)
+        raise typer.Exit(code=1) from exc
+    except ThetaSimError as exc:
+        typer.echo(f"sim compile-task failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"sim compile-task completed successfully in {out_dir}")
 
 
 def main() -> None:

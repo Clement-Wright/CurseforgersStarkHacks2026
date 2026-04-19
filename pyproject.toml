@@ -39,6 +39,7 @@ video_task_compiler = [
   "templates/**/*.yaml",
   "templates/**/*.yml",
   "templates/**/*.md",
+  "assets/**/*.xml",
 ]
 
 [tool.pytest.ini_options]

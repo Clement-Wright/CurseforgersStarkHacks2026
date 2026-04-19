@@ -31,11 +31,17 @@ def test_checked_in_bundle_validates() -> None:
     assert bundle.project.gamma.primary_backbone == "fourdhumans"
     assert bundle.project.delta.primary_backbone == "grounded_sam2"
     assert bundle.project.epsilon.primary_backbone == "artifact_fusion"
+    assert bundle.project.epsilon.geometry_mode == "proxy_scene"
     assert bundle.project.zeta.primary_backbone == "mujoco_safe_assets"
-    assert bundle.project.eta.primary_backbone == "heuristic_ik"
+    assert bundle.project.zeta.asset_mode == "proxy_visual_and_collision"
+    assert bundle.project.eta.primary_backbone == "arm_gripper_waypoint_replay"
+    assert bundle.project.eta.ik_backend == "pinocchio_seed"
+    assert bundle.project.theta.primary_backbone == "canonical_mujoco_task"
     assert bundle.task.pick_object.ontology_id == "target_object"
     assert bundle.capture.beta.normalization.world_frame == "fiducial_center"
     assert bundle.env_specs["sfm"].name == "video-task-compiler-sfm"
+    assert bundle.env_specs["scene"].name == "video-task-compiler-scene"
+    assert bundle.env_specs["sim"].name == "video-task-compiler-sim"
 
 
 def test_missing_project_file_reports_targeted_error(tmp_path: Path) -> None:
@@ -143,6 +149,19 @@ def test_missing_epsilon_block_reports_targeted_error(tmp_path: Path) -> None:
     assert any(issue.field_path == "epsilon" for issue in excinfo.value.issues)
 
 
+def test_missing_theta_block_reports_targeted_error(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    project_path = bundle_root / "spec" / "project.yaml"
+    project_data = _load_yaml(project_path)
+    del project_data["theta"]
+    _write_yaml(project_path, project_data)
+
+    with pytest.raises(SpecValidationError) as excinfo:
+        load_bundle(bundle_root / "spec")
+
+    assert any(issue.field_path == "theta" for issue in excinfo.value.issues)
+
+
 def test_invalid_gamma_acceptance_threshold_is_rejected(tmp_path: Path) -> None:
     bundle_root = _copy_bundle_root(tmp_path / "bundle")
     project_path = bundle_root / "spec" / "project.yaml"
@@ -180,6 +199,32 @@ def test_invalid_eta_acceptance_threshold_is_rejected(tmp_path: Path) -> None:
         load_bundle(bundle_root / "spec")
 
     assert any(issue.field_path == "acceptance.eta_max_joint_step_rad" for issue in excinfo.value.issues)
+
+
+def test_invalid_eta_ik_solve_rate_threshold_is_rejected(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    project_path = bundle_root / "spec" / "project.yaml"
+    project_data = _load_yaml(project_path)
+    project_data["acceptance"]["eta_min_ik_solve_rate"] = 1.2
+    _write_yaml(project_path, project_data)
+
+    with pytest.raises(SpecValidationError) as excinfo:
+        load_bundle(bundle_root / "spec")
+
+    assert any(issue.field_path == "acceptance.eta_min_ik_solve_rate" for issue in excinfo.value.issues)
+
+
+def test_invalid_theta_smoke_steps_are_rejected(tmp_path: Path) -> None:
+    bundle_root = _copy_bundle_root(tmp_path / "bundle")
+    project_path = bundle_root / "spec" / "project.yaml"
+    project_data = _load_yaml(project_path)
+    project_data["acceptance"]["theta_trace_smoke_steps"] = 0
+    _write_yaml(project_path, project_data)
+
+    with pytest.raises(SpecValidationError) as excinfo:
+        load_bundle(bundle_root / "spec")
+
+    assert any(issue.field_path == "acceptance.theta_trace_smoke_steps" for issue in excinfo.value.issues)
 
 
 def test_task_regions_must_stay_inside_workspace(tmp_path: Path) -> None:

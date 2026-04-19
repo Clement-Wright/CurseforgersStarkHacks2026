@@ -1,0 +1,15 @@
+name: video-task-compiler-scene
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pillow
+  - pyarrow
+  - pyyaml
+  - typer
+  - imageio
+  - pip:
+      - -e .[dev]
+      - av>=13,<18

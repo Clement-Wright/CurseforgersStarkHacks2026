@@ -1,0 +1,14 @@
+name: video-task-compiler-sim
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pyarrow
+  - pyyaml
+  - pillow
+  - typer
+  - pip:
+      - mujoco
+      - pin

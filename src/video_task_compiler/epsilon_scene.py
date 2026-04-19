@@ -9,11 +9,18 @@ from typing import Any, Sequence
 
 import imageio.v2 as imageio
 import numpy as np
+import pyarrow.parquet as pq
 from PIL import Image, ImageDraw
 
 from .human_extract import GammaIntrinsics, load_camera_intrinsics, load_camera_pose_map
 from .object_extract import decode_coco_rle_mask, load_frame_index_csv
 from .specs import PROJECT_SCHEMA_VERSION, SpecBundle
+from .task_window import (
+    TaskWindowError,
+    filter_items_to_task_window,
+    persist_task_window,
+    resolve_task_window,
+)
 
 
 class EpsilonSceneError(Exception):
@@ -34,6 +41,10 @@ class ObjectGeometryEstimate:
     extents_m: np.ndarray
     observed_frame_idx: int | None
     support_height_m: float
+    frames_used: list[int]
+    footprint_estimator: str
+    height_mode: str
+    raw_planar_extent_stats_m: dict[str, Any]
 
 
 def _path_string(path: Path) -> str:
@@ -57,7 +68,7 @@ def _sanitize_name(value: str) -> str:
 
 def missing_epsilon_dependencies() -> list[str]:
     missing: list[str] = []
-    for module_name in ("imageio", "numpy", "PIL"):
+    for module_name in ("imageio", "numpy", "PIL", "pyarrow"):
         if importlib.util.find_spec(module_name) is None:
             missing.append(module_name)
     return missing
@@ -85,6 +96,30 @@ def _mask_centroid_and_bbox(mask: np.ndarray) -> tuple[np.ndarray | None, list[f
     return centroid, bbox
 
 
+def _mask_boundary_pixels(mask: np.ndarray) -> np.ndarray:
+    if mask.ndim != 2 or not mask.any():
+        return np.zeros((0, 2), dtype=float)
+    interior = np.zeros_like(mask, dtype=bool)
+    interior[1:-1, 1:-1] = (
+        mask[1:-1, 1:-1]
+        & mask[:-2, 1:-1]
+        & mask[2:, 1:-1]
+        & mask[1:-1, :-2]
+        & mask[1:-1, 2:]
+    )
+    boundary = mask & ~interior
+    rows, cols = np.nonzero(boundary)
+    return np.column_stack((cols.astype(float) + 0.5, rows.astype(float) + 0.5))
+
+
+def _sample_boundary_pixels(mask: np.ndarray, max_points: int = 128) -> np.ndarray:
+    pixels = _mask_boundary_pixels(mask)
+    if len(pixels) <= max_points:
+        return pixels
+    step = max(1, int(math.ceil(len(pixels) / max_points)))
+    return pixels[::step]
+
+
 def _load_masks_by_reference(path: Path) -> dict[str, np.ndarray]:
     if not path.exists():
         return {}
@@ -101,6 +136,12 @@ def _load_masks_by_reference(path: Path) -> dict[str, np.ndarray]:
             continue
         masks_by_reference[f"objects/masks_rle.jsonl:{line_number}"] = np.asarray(mask, dtype=bool)
     return masks_by_reference
+
+
+def _load_interaction_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    return pq.read_table(path).to_pylist()
 
 
 def _project_world_point(
@@ -159,6 +200,49 @@ def _intersect_support_plane(
     return point
 
 
+def _project_mask_boundary_to_plane(
+    mask: np.ndarray,
+    intrinsics: GammaIntrinsics | None,
+    T_wc: np.ndarray | None,
+    support_height_m: float,
+) -> np.ndarray:
+    if intrinsics is None or T_wc is None:
+        return np.zeros((0, 2), dtype=float)
+    sampled_pixels = _sample_boundary_pixels(mask)
+    if len(sampled_pixels) == 0:
+        return np.zeros((0, 2), dtype=float)
+    points_world: list[np.ndarray] = []
+    for u, v in sampled_pixels:
+        point_world = _intersect_support_plane(float(u), float(v), intrinsics, T_wc, support_height_m)
+        if point_world is not None and np.isfinite(point_world[:2]).all():
+            points_world.append(point_world[:2])
+    if len(points_world) < 3:
+        return np.zeros((0, 2), dtype=float)
+    return np.asarray(points_world, dtype=float)
+
+
+def _fit_planar_obb(points_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    if len(points_xy) < 3:
+        return None
+    mean_xy = np.mean(points_xy, axis=0)
+    centered = points_xy - mean_xy
+    covariance = np.cov(centered.T)
+    if covariance.shape != (2, 2):
+        return None
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    order = np.argsort(eigenvalues)[::-1]
+    basis = eigenvectors[:, order]
+    if np.linalg.det(basis) < 0.0:
+        basis[:, 1] *= -1.0
+    local = centered @ basis
+    min_local = np.min(local, axis=0)
+    max_local = np.max(local, axis=0)
+    extents_xy = np.maximum(max_local - min_local, 0.0)
+    center_local = 0.5 * (min_local + max_local)
+    center_xy = mean_xy + basis @ center_local
+    return center_xy.astype(float), np.sort(extents_xy.astype(float))[::-1]
+
+
 def _bbox_extent_on_plane(
     bbox_xyxy: Sequence[float],
     intrinsics: GammaIntrinsics | None,
@@ -178,6 +262,40 @@ def _bbox_extent_on_plane(
     corners_array = np.asarray(corners_world, dtype=float)
     extents = np.ptp(corners_array[:, :2], axis=0)
     return np.maximum(extents, 0.0)
+
+
+def _extent_stats(extents_xy: Sequence[np.ndarray]) -> dict[str, Any]:
+    if not extents_xy:
+        return {
+            "sample_count": 0,
+            "min_xy": None,
+            "p25_xy": None,
+            "median_xy": None,
+            "p35_xy": None,
+            "p75_xy": None,
+            "max_xy": None,
+        }
+    values = np.asarray(extents_xy, dtype=float)
+    return {
+        "sample_count": int(len(values)),
+        "min_xy": np.min(values, axis=0).tolist(),
+        "p25_xy": np.quantile(values, 0.25, axis=0).tolist(),
+        "median_xy": np.quantile(values, 0.50, axis=0).tolist(),
+        "p35_xy": np.quantile(values, 0.35, axis=0).tolist(),
+        "p75_xy": np.quantile(values, 0.75, axis=0).tolist(),
+        "max_xy": np.max(values, axis=0).tolist(),
+    }
+
+
+def _first_contact_frame_idx(rows: Sequence[dict[str, Any]], class_name: str) -> int | None:
+    candidates = [
+        row
+        for row in rows
+        if row.get("class_name") == class_name and bool(row.get("likely_contact_boolean"))
+    ]
+    if not candidates:
+        return None
+    return min(int(row.get("frame_idx", 0)) for row in candidates)
 
 
 def _region_center_xy(bundle: SpecBundle, ontology_id: str, support_height_m: float) -> np.ndarray:
@@ -237,15 +355,18 @@ def _estimate_object_geometries(
     bundle: SpecBundle,
     object_tracks_payload: dict[str, Any],
     masks_by_reference: dict[str, np.ndarray],
+    interaction_rows: Sequence[dict[str, Any]],
     camera_pose_payload: dict[int, Any],
     intrinsics: GammaIntrinsics | None,
     support_height_m: float,
+    task_window: Any,
 ) -> list[ObjectGeometryEstimate]:
     ontology_kind = {entity.id: entity.kind for entity in bundle.ontology.entities}
     track_payloads = object_tracks_payload.get("tracks", [])
     if not isinstance(track_payloads, list):
         raise EpsilonSceneError("objects/object_tracks.json did not contain a 'tracks' list")
 
+    target_contact_frame = _first_contact_frame_idx(interaction_rows, bundle.project.ontology.target_object_id)
     estimates: list[ObjectGeometryEstimate] = []
     for track in track_payloads:
         if not isinstance(track, dict):
@@ -261,18 +382,37 @@ def _estimate_object_geometries(
         centers_xy: list[np.ndarray] = []
         extents_xy: list[np.ndarray] = []
         observed_frame_idx: int | None = None
+        frames_used: list[int] = []
         for frame in track.get("frames", []):
             if not isinstance(frame, dict) or not frame.get("visible", True):
                 continue
             frame_idx = int(frame.get("frame_idx", -1))
+            if not task_window.contains(frame_idx):
+                continue
+            if (
+                ontology_id == bundle.project.ontology.target_object_id
+                and target_contact_frame is not None
+                and frame_idx >= target_contact_frame
+            ):
+                continue
             pose = camera_pose_payload.get(frame_idx)
             mask_ref = str(frame.get("mask_rle_ref", ""))
             mask = masks_by_reference.get(mask_ref)
 
             centroid_uv: np.ndarray | None = None
-            bbox_xyxy: list[float] | None = None
+            center_xy: np.ndarray | None = None
             if mask is not None and mask.any():
-                centroid_uv, bbox_xyxy = _mask_centroid_and_bbox(mask)
+                centroid_uv, _ = _mask_centroid_and_bbox(mask)
+                projected_boundary_xy = _project_mask_boundary_to_plane(
+                    mask,
+                    intrinsics,
+                    pose.T_wc if pose is not None else None,
+                    support_height_m,
+                )
+                obb_fit = _fit_planar_obb(projected_boundary_xy)
+                if obb_fit is not None:
+                    center_xy, extent_xy = obb_fit
+                    extents_xy.append(np.asarray(extent_xy, dtype=float))
             if centroid_uv is None:
                 centroid_payload = frame.get("centroid_uv")
                 if isinstance(centroid_payload, (list, tuple)) and len(centroid_payload) >= 2:
@@ -280,22 +420,7 @@ def _estimate_object_geometries(
                         [float(centroid_payload[0]), float(centroid_payload[1])],
                         dtype=float,
                     )
-            if bbox_xyxy is None:
-                bbox_payload = frame.get("bbox_xyxy")
-                if isinstance(bbox_payload, (list, tuple)) and len(bbox_payload) == 4:
-                    bbox_xyxy = [float(value) for value in bbox_payload]
-
-            if centroid_uv is None and bbox_xyxy is not None:
-                centroid_uv = np.array(
-                    [
-                        0.5 * (bbox_xyxy[0] + bbox_xyxy[2]),
-                        0.5 * (bbox_xyxy[1] + bbox_xyxy[3]),
-                    ],
-                    dtype=float,
-                )
-
-            center_world = None
-            if centroid_uv is not None:
+            if center_xy is None and centroid_uv is not None:
                 center_world = _intersect_support_plane(
                     float(centroid_uv[0]),
                     float(centroid_uv[1]),
@@ -303,19 +428,12 @@ def _estimate_object_geometries(
                     pose.T_wc if pose is not None else None,
                     support_height_m,
                 )
-            if center_world is not None:
-                centers_xy.append(center_world[:2])
+                if center_world is not None:
+                    center_xy = center_world[:2]
+            if center_xy is not None:
+                centers_xy.append(np.asarray(center_xy, dtype=float))
+                frames_used.append(frame_idx)
                 observed_frame_idx = frame_idx if observed_frame_idx is None else min(observed_frame_idx, frame_idx)
-
-            if bbox_xyxy is not None:
-                extent_xy = _bbox_extent_on_plane(
-                    bbox_xyxy,
-                    intrinsics,
-                    pose.T_wc if pose is not None else None,
-                    support_height_m,
-                )
-                if extent_xy is not None:
-                    extents_xy.append(extent_xy)
 
         fallback_center = _region_center_xy(bundle, ontology_id, support_height_m)
         if centers_xy:
@@ -323,18 +441,14 @@ def _estimate_object_geometries(
         else:
             center_xy = fallback_center[:2]
 
+        extent_stats = _extent_stats(extents_xy)
         if extents_xy:
-            extent_xy = np.median(np.asarray(extents_xy, dtype=float), axis=0)
+            extent_xy = np.asarray(extent_stats["p35_xy"], dtype=float)
         else:
             extent_xy = _default_object_extent_xy(bundle, ontology_id)
-        extent_xy = np.clip(extent_xy, 0.02, 0.25)
+        extent_xy = np.clip(extent_xy, 0.015, 0.25)
 
-        height_m = float(
-            max(
-                bundle.project.epsilon.default_object_height_m,
-                min(0.12, 0.6 * float(np.max(extent_xy))),
-            )
-        )
+        height_m = float(bundle.project.epsilon.default_object_height_m)
         position_m = np.array(
             [float(center_xy[0]), float(center_xy[1]), support_height_m + 0.5 * height_m],
             dtype=float,
@@ -349,6 +463,10 @@ def _estimate_object_geometries(
                 extents_m=np.array([float(extent_xy[0]), float(extent_xy[1]), height_m], dtype=float),
                 observed_frame_idx=observed_frame_idx,
                 support_height_m=support_height_m,
+                frames_used=sorted(set(frames_used)),
+                footprint_estimator="support_plane_mask_obb",
+                height_mode="proxy_default_height",
+                raw_planar_extent_stats_m=extent_stats,
             )
         )
     return estimates
@@ -359,26 +477,43 @@ def _static_scene_bounds(
     estimates: Sequence[ObjectGeometryEstimate],
     support_height_m: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    workspace = bundle.robot.workspace_bounds_m
-    min_corner = np.array(
-        [
-            float(workspace.min_m.x),
-            float(workspace.min_m.y),
-            support_height_m - 0.01,
-        ],
-        dtype=float,
-    )
-    max_corner = np.array(
-        [
-            float(workspace.max_m.x),
-            float(workspace.max_m.y),
-            support_height_m + 0.02,
-        ],
-        dtype=float,
-    )
+    region_points = [
+        np.array(
+            [
+                bundle.task.pick_object.search_region_m.min_m.x,
+                bundle.task.pick_object.search_region_m.min_m.y,
+            ],
+            dtype=float,
+        ),
+        np.array(
+            [
+                bundle.task.pick_object.search_region_m.max_m.x,
+                bundle.task.pick_object.search_region_m.max_m.y,
+            ],
+            dtype=float,
+        ),
+        np.array(
+            [
+                bundle.task.place_region.target_region_m.min_m.x,
+                bundle.task.place_region.target_region_m.min_m.y,
+            ],
+            dtype=float,
+        ),
+        np.array(
+            [
+                bundle.task.place_region.target_region_m.max_m.x,
+                bundle.task.place_region.target_region_m.max_m.y,
+            ],
+            dtype=float,
+        ),
+    ]
+    min_xy = np.min(np.asarray(region_points, dtype=float), axis=0)
+    max_xy = np.max(np.asarray(region_points, dtype=float), axis=0)
     for estimate in estimates:
-        min_corner[:2] = np.minimum(min_corner[:2], estimate.position_m[:2] - 0.5 * estimate.extents_m[:2] - 0.04)
-        max_corner[:2] = np.maximum(max_corner[:2], estimate.position_m[:2] + 0.5 * estimate.extents_m[:2] + 0.04)
+        min_xy = np.minimum(min_xy, estimate.position_m[:2] - 0.5 * estimate.extents_m[:2] - 0.08)
+        max_xy = np.maximum(max_xy, estimate.position_m[:2] + 0.5 * estimate.extents_m[:2] + 0.08)
+    min_corner = np.array([float(min_xy[0]), float(min_xy[1]), support_height_m - 0.01], dtype=float)
+    max_corner = np.array([float(max_xy[0]), float(max_xy[1]), support_height_m + 0.02], dtype=float)
     return min_corner, max_corner
 
 
@@ -488,9 +623,17 @@ def _write_obj_mesh(path: Path, vertices: np.ndarray, faces: Sequence[Sequence[i
 
 def _camera_pose_payload_metric(raw_payload: dict[str, Any], metric_world_frame: str) -> dict[str, Any]:
     metric_payload = dict(raw_payload)
-    metric_payload["source_world"] = raw_payload.get("world_frame", "W")
+    source_world = str(
+        raw_payload.get("world_frame")
+        or raw_payload.get("coordinate_frame")
+        or "W"
+    )
+    metric_payload["source_world"] = source_world
     metric_payload["world_frame"] = metric_world_frame
     metric_payload["target_world"] = metric_world_frame
+    metric_payload["metric_alignment_mode"] = "inherited_from_beta"
+    metric_payload["transform_source"] = "inherited_from_beta_fiducial_world"
+    metric_payload["measured"] = False
     metric_frames: list[dict[str, Any]] = []
     for frame in raw_payload.get("frames", []):
         if not isinstance(frame, dict):
@@ -563,42 +706,62 @@ def _write_qc_video(
 def _build_summary(
     bundle: SpecBundle,
     estimates: Sequence[ObjectGeometryEstimate],
-    plane_rmse_m: float,
-    scale_anchor_rel_error: float,
     qc_video_format: str,
+    proxy_artifacts_nonempty_ok: bool,
+    object_init_serializable_ok: bool,
 ) -> dict[str, Any]:
     return {
         "schema_version": PROJECT_SCHEMA_VERSION,
         "video_id": bundle.project.video_id,
         "source": bundle.project.epsilon.primary_backbone,
+        "geometry_mode": bundle.project.epsilon.geometry_mode,
+        "metric_alignment_mode": bundle.project.epsilon.metric_alignment_mode,
         "metric_world_frame": bundle.project.epsilon.metric_world_frame,
         "object_count": len(estimates),
         "object_ids": [estimate.ontology_id for estimate in estimates],
+        "metric_alignment": {
+            "transform_source": "inherited_from_beta_fiducial_world",
+            "measured": False,
+            "qa_status": "not_applicable",
+        },
         "qa": {
-            "support_plane_rmse_m": plane_rmse_m,
-            "scale_anchor_rel_error": scale_anchor_rel_error,
+            "support_plane_rmse_m": None,
+            "scale_anchor_rel_error": None,
+            "qa_status": {
+                "support_plane_rmse_m": "not_applicable",
+                "scale_anchor_rel_error": "not_applicable",
+            },
             "qc_video_format": qc_video_format,
         },
+        "object_geometry_diagnostics": [
+            {
+                "ontology_id": estimate.ontology_id,
+                "track_id": estimate.track_id,
+                "footprint_estimator": estimate.footprint_estimator,
+                "height_mode": estimate.height_mode,
+                "frames_used": estimate.frames_used,
+                "raw_planar_extent_stats_m": estimate.raw_planar_extent_stats_m,
+                "final_extents_m": estimate.extents_m.tolist(),
+            }
+            for estimate in estimates
+        ],
         "qc_flags": {
-            "support_plane_ok": plane_rmse_m <= bundle.project.acceptance.epsilon_max_support_plane_rmse_m,
-            "scale_anchor_ok": scale_anchor_rel_error <= bundle.project.acceptance.epsilon_max_scale_anchor_rel_error,
+            "truthful_provenance_ok": True,
+            "proxy_artifacts_nonempty_ok": proxy_artifacts_nonempty_ok,
+            "object_init_serializable_ok": object_init_serializable_ok,
         },
     }
 
 
 def enforce_epsilon_acceptance(bundle: SpecBundle, summary: dict[str, Any]) -> None:
-    plane_rmse_m = float(summary["qa"]["support_plane_rmse_m"])
-    if plane_rmse_m > bundle.project.acceptance.epsilon_max_support_plane_rmse_m:
-        raise EpsilonSceneError(
-            f"support plane rmse {plane_rmse_m:.4f}m exceeded "
-            f"epsilon_max_support_plane_rmse_m={bundle.project.acceptance.epsilon_max_support_plane_rmse_m:.4f}m"
-        )
-    scale_anchor_rel_error = float(summary["qa"]["scale_anchor_rel_error"])
-    if scale_anchor_rel_error > bundle.project.acceptance.epsilon_max_scale_anchor_rel_error:
-        raise EpsilonSceneError(
-            f"scale anchor relative error {scale_anchor_rel_error:.4f} exceeded "
-            f"epsilon_max_scale_anchor_rel_error={bundle.project.acceptance.epsilon_max_scale_anchor_rel_error:.4f}"
-        )
+    if bundle.project.acceptance.epsilon_require_truthful_provenance and not bool(
+        summary["qc_flags"]["truthful_provenance_ok"]
+    ):
+        raise EpsilonSceneError("epsilon proxy-scene provenance did not satisfy the truthful-provenance contract")
+    if not bool(summary["qc_flags"]["proxy_artifacts_nonempty_ok"]):
+        raise EpsilonSceneError("epsilon proxy-scene artifacts were empty or incomplete")
+    if not bool(summary["qc_flags"]["object_init_serializable_ok"]):
+        raise EpsilonSceneError("epsilon object initialization payload was not deterministically serializable")
 
 
 def compile_metric_scene(
@@ -608,13 +771,36 @@ def compile_metric_scene(
     out_dir: Path,
 ) -> dict[str, Any]:
     ensure_epsilon_dependencies()
+    if bundle.project.epsilon.geometry_mode != "proxy_scene":
+        raise EpsilonSceneError(
+            f"epsilon geometry_mode '{bundle.project.epsilon.geometry_mode}' is not implemented yet; "
+            "the current MVP supports only proxy_scene"
+        )
+    if bundle.project.epsilon.metric_alignment_mode != "inherited_from_beta":
+        raise EpsilonSceneError(
+            f"epsilon metric_alignment_mode '{bundle.project.epsilon.metric_alignment_mode}' is not implemented yet; "
+            "the current MVP supports only inherited_from_beta"
+        )
 
     frame_records = load_frame_index_csv(beta_dir / "frames" / "index.csv")
+    try:
+        task_window = resolve_task_window(
+            frame_records,
+            video_id=bundle.project.video_id,
+            artifact_roots=(delta_dir, out_dir, beta_dir),
+        )
+    except TaskWindowError as exc:
+        raise EpsilonSceneError(str(exc)) from exc
     raw_camera_pose_payload = _load_json(beta_dir / "camera" / "camera_poses.json")
     camera_pose_payload = load_camera_pose_map(beta_dir / "camera" / "camera_poses.json")
     intrinsics = load_camera_intrinsics(beta_dir / "camera" / "intrinsics.json")
     object_tracks_payload = _load_json(delta_dir / "objects" / "object_tracks.json")
     masks_by_reference = _load_masks_by_reference(delta_dir / "objects" / "masks_rle.jsonl")
+    interaction_rows = filter_items_to_task_window(
+        _load_interaction_rows(delta_dir / "objects" / "interactions.parquet"),
+        task_window,
+    )
+    frame_records = filter_items_to_task_window(frame_records, task_window)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     camera_dir = out_dir / "camera"
@@ -624,15 +810,18 @@ def compile_metric_scene(
     qc_dir = scene_dir / "qc"
     for path in (camera_dir, scene_dir, dense_dir, object_clouds_dir, qc_dir):
         path.mkdir(parents=True, exist_ok=True)
+    persist_task_window(task_window, out_dir, video_id=bundle.project.video_id)
 
     support_height_m = _support_height_m(bundle)
     estimates = _estimate_object_geometries(
         bundle=bundle,
         object_tracks_payload=object_tracks_payload,
         masks_by_reference=masks_by_reference,
+        interaction_rows=interaction_rows,
         camera_pose_payload=camera_pose_payload,
         intrinsics=intrinsics,
         support_height_m=support_height_m,
+        task_window=task_window,
     )
     min_corner, max_corner = _static_scene_bounds(bundle, estimates, support_height_m)
     static_center = 0.5 * (min_corner + max_corner)
@@ -665,10 +854,17 @@ def compile_metric_scene(
                 "ontology_id": estimate.ontology_id,
                 "class_name": estimate.class_name,
                 "object_frame": estimate.object_frame,
+                "geometry_source": "proxy_box_surface",
+                "measured": False,
+                "footprint_estimator": estimate.footprint_estimator,
+                "height_mode": estimate.height_mode,
                 "position_m": estimate.position_m.tolist(),
                 "extents_m": estimate.extents_m.tolist(),
+                "final_extents_m": estimate.extents_m.tolist(),
                 "support_height_m": estimate.support_height_m,
                 "observed_frame_idx": estimate.observed_frame_idx,
+                "frames_used": estimate.frames_used,
+                "raw_planar_extent_stats_m": estimate.raw_planar_extent_stats_m,
                 "T_MO": T_MO.tolist(),
                 "point_cloud_path": f"scene/object_clouds/{track_name}.ply",
             }
@@ -676,14 +872,21 @@ def compile_metric_scene(
 
     world_metric_payload = {
         "schema_version": PROJECT_SCHEMA_VERSION,
-        "source_world": raw_camera_pose_payload.get("world_frame", "W"),
+        "source_world": str(
+            raw_camera_pose_payload.get("world_frame")
+            or raw_camera_pose_payload.get("coordinate_frame")
+            or "W"
+        ),
         "target_world": bundle.project.epsilon.metric_world_frame,
         "sim3_M_from_W": {
             "scale_m_per_world_unit": 1.0,
             "rotation_matrix": np.eye(3, dtype=float).tolist(),
             "translation_m": [0.0, 0.0, 0.0],
         },
-        "anchor_method": "beta_identity_plus_task_region_support_plane",
+        "transform_source": "inherited_from_beta_fiducial_world",
+        "measured": False,
+        "qa_status": "not_applicable",
+        "anchor_method": "inherited_from_beta",
         "preserve_beta_world": True,
     }
     support_plane_payload = {
@@ -693,12 +896,17 @@ def compile_metric_scene(
         "offset_m": support_height_m,
         "height_m": support_height_m,
         "source": bundle.project.epsilon.support_plane_source,
+        "measured": False,
+        "qa_status": "not_applicable",
     }
     static_mesh_meta = {
         "schema_version": PROJECT_SCHEMA_VERSION,
         "mesh_path": "scene/static_mesh.obj",
         "world_frame": bundle.project.epsilon.metric_world_frame,
         "units": "meters",
+        "geometry_mode": bundle.project.epsilon.geometry_mode,
+        "derived_from_dense_reconstruction": False,
+        "geometry_source": "task_regions_plus_mask_projection",
         "source": {
             "beta_dir": _path_string(beta_dir),
             "delta_dir": _path_string(delta_dir),
@@ -744,8 +952,12 @@ def compile_metric_scene(
         bundle.project.epsilon.qc_overlay_frame_count,
     )
     static_mesh_meta["qa"] = {
-        "plane_rmse_m": 0.0,
-        "scale_anchor_rel_error": 0.0,
+        "plane_rmse_m": None,
+        "scale_anchor_rel_error": None,
+        "qa_status": {
+            "plane_rmse_m": "not_applicable",
+            "scale_anchor_rel_error": "not_applicable",
+        },
         "qc_video_format": qc_video_format,
     }
     (scene_dir / "static_mesh.meta.json").write_text(
@@ -753,12 +965,30 @@ def compile_metric_scene(
         encoding="utf-8",
     )
 
+    proxy_artifact_paths = [
+        dense_dir / "fused.ply",
+        dense_dir / "meshed-poisson.ply",
+        dense_dir / "meshed-delaunay.ply",
+        scene_dir / "static_mesh_raw.ply",
+        scene_dir / "static_mesh.obj",
+        scene_dir / "object_init_poses_metric.json",
+    ]
+    proxy_artifact_paths.extend(
+        object_clouds_dir / f"{_sanitize_name(estimate.track_id)}.ply" for estimate in estimates
+    )
+    proxy_artifacts_nonempty_ok = all(path.exists() and path.stat().st_size > 0 for path in proxy_artifact_paths)
+    try:
+        json.dumps(object_payload)
+        object_init_serializable_ok = True
+    except TypeError:
+        object_init_serializable_ok = False
+
     summary = _build_summary(
         bundle=bundle,
         estimates=estimates,
-        plane_rmse_m=0.0,
-        scale_anchor_rel_error=0.0,
         qc_video_format=qc_video_format,
+        proxy_artifacts_nonempty_ok=proxy_artifacts_nonempty_ok,
+        object_init_serializable_ok=object_init_serializable_ok,
     )
     (scene_dir / "epsilon_summary.json").write_text(
         json.dumps(summary, indent=2) + "\n",

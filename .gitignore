@@ -1,5 +1,6 @@
 .pytest_cache/
 .pytest_tmp/
+.pytest_tmp*/
 __pycache__/
 *.py[cod]
 *.egg-info/
